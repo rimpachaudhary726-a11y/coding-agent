@@ -152,6 +152,41 @@ def run_bash(command, confirmed=False, timeout=60):
     return f"(exit code {result.returncode})\n{output}"
 
 
+def detect_and_run_tests(root="."):
+    """
+    Looks for a recognizable test setup in `root` and runs it if found.
+    Checks, in order: pytest (tests/ dir or *_test.py files, or pytest.ini/
+    pyproject.toml with a [tool.pytest] section), then package.json with a
+    "test" script (npm test). Returns what it found and the run's output,
+    or a clear message if no test setup was detected — so the caller (the
+    agent) knows whether "no tests ran" means "all good" or "nothing to run".
+    """
+    has_pytest_config = os.path.exists(os.path.join(root, "pytest.ini")) or \
+        os.path.exists(os.path.join(root, "conftest.py"))
+    has_test_dir = os.path.isdir(os.path.join(root, "tests"))
+    has_test_files = any(
+        f.startswith("test_") or f.endswith("_test.py")
+        for f in os.listdir(root) if os.path.isfile(os.path.join(root, f))
+    ) if os.path.isdir(root) else False
+
+    if has_pytest_config or has_test_dir or has_test_files:
+        result = run_bash("python3 -m pytest -q", confirmed=True, timeout=120)
+        return f"Detected a pytest setup. Ran `python3 -m pytest -q`:\n{result}"
+
+    package_json = os.path.join(root, "package.json")
+    if os.path.exists(package_json):
+        try:
+            with open(package_json, "r") as f:
+                pkg = json.load(f)
+            if pkg.get("scripts", {}).get("test"):
+                result = run_bash("npm test", confirmed=True, timeout=120)
+                return f"Detected an npm test script. Ran `npm test`:\n{result}"
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return "No recognizable test setup found (no tests/, test_*.py files, pytest config, or npm test script). Nothing was run."
+
+
 def git_commit(message, add_all=True):
     if add_all:
         add_result = run_bash("git add -A", confirmed=True)
@@ -212,6 +247,15 @@ TOOL_SCHEMA = [
         }, "required": ["command"]},
     }},
     {"type": "function", "function": {
+        "name": "detect_and_run_tests",
+        "description": "Auto-detect the project's test setup (pytest or npm test) and run it. "
+                        "Call this after making code changes, before declaring a task done, "
+                        "whenever the project has a test suite.",
+        "parameters": {"type": "object", "properties": {
+            "root": {"type": "string", "default": "."}
+        }},
+    }},
+    {"type": "function", "function": {
         "name": "git_commit",
         "description": "Stage all changes and commit them with a message.",
         "parameters": {"type": "object", "properties": {
@@ -227,5 +271,6 @@ TOOL_FUNCTIONS = {
     "list_directory": list_directory,
     "search_codebase": search_codebase,
     "run_bash": run_bash,
+    "detect_and_run_tests": detect_and_run_tests,
     "git_commit": git_commit,
 }
