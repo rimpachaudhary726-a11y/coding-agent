@@ -18,11 +18,13 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from provider_pool import ask_ai
-from tools import TOOL_SCHEMA, TOOL_FUNCTIONS
+from tools import TOOL_SCHEMA, TOOL_FUNCTIONS, _matches_any, _DESTRUCTIVE_PATTERNS
 from firebase_tools import FIREBASE_TOOL_SCHEMA, FIREBASE_TOOL_FUNCTIONS
+from github_tools import GITHUB_TOOL_SCHEMA, GITHUB_TOOL_FUNCTIONS
+import task_memory
 
-TOOL_SCHEMA = TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA
-TOOL_FUNCTIONS = {**TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS}
+TOOL_SCHEMA = TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA + GITHUB_TOOL_SCHEMA
+TOOL_FUNCTIONS = {**TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS}
 
 SYSTEM_PROMPT = """You are a coding agent with direct access to the filesystem \
 and shell via tools. You can read, write, and edit files, search the codebase, \
@@ -34,12 +36,15 @@ When a task is genuinely finished, reply with plain text and no further tool cal
 When looking for a file, check the project root first (list_directory(".")) \
 before searching subfolders. Ignore artifacts/, node_modules/, lib/, .cache/, \
 and other tooling/dependency folders unless the user's request specifically \
-points there — the user's own code almost always lives at the project root."""
+points there — the user's own code almost always lives at the project root.
+
+If the project has a test suite, call detect_and_run_tests after making code \
+changes, before declaring the task done — don't just assume a fix works."""
 
 MAX_TURNS = 40
 
 
-def _execute_tool_call(tool_call, confirm_destructive=False):
+def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None):
     name = tool_call["function"]["name"]
     try:
         args = json.loads(tool_call["function"]["arguments"] or "{}")
@@ -50,8 +55,19 @@ def _execute_tool_call(tool_call, confirm_destructive=False):
     if not func:
         return f"ERROR: unknown tool '{name}'"
 
-    if name == "run_bash" and confirm_destructive:
-        args["confirmed"] = True
+    if name == "run_bash":
+        command = args.get("command", "")
+        if confirm_destructive:
+            args["confirmed"] = True
+        elif confirm_callback and _matches_any(command.strip(), _DESTRUCTIVE_PATTERNS):
+            # Real pause here — ask a human before running anything destructive,
+            # instead of just reporting CONFIRMATION_REQUIRED back to the model
+            # and moving on.
+            allowed = confirm_callback(command)
+            if allowed:
+                args["confirmed"] = True
+            else:
+                return f"Command declined by user: '{command}'. Not run. Try a different approach."
 
     try:
         return func(**args)
@@ -61,17 +77,34 @@ def _execute_tool_call(tool_call, confirm_destructive=False):
         return f"ERROR: {name} raised an exception: {e}"
 
 
-def run_agent(task, on_step=None, auto_confirm=False):
+def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
     """
     Runs the core tool-calling loop until the model stops calling tools
-    or MAX_TURNS is hit. `on_step` is an optional callback(message_dict)
-    for live CLI output. `auto_confirm` skips the destructive-command
-    confirmation prompt (used by fan-out leaves running unattended —
-    keep this False for anything actually destructive in production use).
+    or MAX_TURNS is hit.
+
+    `on_step` — optional callback(message_dict) for live CLI output.
+    `auto_confirm` — skips confirmation entirely, destructive commands just
+        run (used by fan-out leaves running unattended).
+    `confirm_callback` — optional callback(command) -> bool, called for real
+        when a destructive command needs a yes/no from an actual human
+        (see cli.py for the interactive version). Ignored if auto_confirm=True.
+    `use_memory` — pull in relevant past-session summaries for this project
+        and save a summary of this task when it finishes. Set False for
+        fan-out leaves to avoid many parallel writers hitting the same file.
+
     Returns the final plain-text response.
     """
+    memory_context = ""
+    if use_memory:
+        relevant = task_memory.retrieve_relevant(task)
+        memory_context = task_memory.format_for_prompt(relevant)
+
+    system_content = SYSTEM_PROMPT
+    if memory_context:
+        system_content += "\n\n" + memory_context
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": task},
     ]
 
@@ -89,7 +122,10 @@ def run_agent(task, on_step=None, auto_confirm=False):
             on_step({"turn": turn, "content": content, "tool_calls": tool_calls})
 
         if not tool_calls:
-            return content or "(no response)"
+            final = content or "(no response)"
+            if use_memory:
+                task_memory.add_task_summary(task, final)
+            return final
 
         messages.append({
             "role": "assistant",
@@ -102,14 +138,19 @@ def run_agent(task, on_step=None, auto_confirm=False):
                 "id": tc.id,
                 "function": {"name": tc.function.name, "arguments": tc.function.arguments},
             }
-            result = _execute_tool_call(tc_dict, confirm_destructive=auto_confirm)
+            result = _execute_tool_call(
+                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback
+            )
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc_dict["id"],
                 "content": str(result)[:6000],  # cap so one huge result can't blow the context
             })
 
-    return "Reached max turns without finishing — task may be too large for one run."
+    timeout_msg = "Reached max turns without finishing — task may be too large for one run."
+    if use_memory:
+        task_memory.add_task_summary(task, timeout_msg)
+    return timeout_msg
 
 
 def fan_out(task_template, targets, max_workers=8, auto_confirm=True):
@@ -121,12 +162,16 @@ def fan_out(task_template, targets, max_workers=8, auto_confirm=True):
     Returns {target: result} for all targets. max_workers caps real
     concurrency (and therefore concurrent API calls) — raise cautiously,
     your Cerebras key pool is the real ceiling on how many can run at once
-    without hitting rate limits.
+    without hitting rate limits. use_memory is off for leaves to avoid
+    many parallel workers writing to the same .agent_memory.json at once.
     """
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_target = {
-            executor.submit(run_agent, task_template.format(target=t), None, auto_confirm): t
+            executor.submit(
+                run_agent, task_template.format(target=t),
+                None, auto_confirm, None, False
+            ): t
             for t in targets
         }
         for future in as_completed(future_to_target):

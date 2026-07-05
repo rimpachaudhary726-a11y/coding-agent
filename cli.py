@@ -27,13 +27,21 @@ def _print_step(step):
             print(f"   🔧 {name}({args})")
 
 
+def _ask_confirmation(command):
+    """Real pause — asks you directly before a destructive command runs."""
+    print(f"\n⚠️  About to run a potentially destructive command:")
+    print(f"   {command}")
+    answer = input("   Allow this? [y/N] ").strip().lower()
+    return answer == "y"
+
+
 def main():
     print("=== Coding Agent CLI ===")
     print("Type your task, or 'quit' to exit.\n")
 
     if len(sys.argv) > 1:
         task = " ".join(sys.argv[1:])
-        result = run_agent(task, on_step=_print_step)
+        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
         print(f"\n✅ {result}")
         return
 
@@ -48,7 +56,7 @@ def main():
         if task.lower() in ("quit", "exit"):
             print("bye")
             break
-        result = run_agent(task, on_step=_print_step)
+        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
         print(f"\n✅ {result}")
 
 
