@@ -29,9 +29,14 @@ and shell via tools. You can read, write, and edit files, search the codebase, \
 run commands, and commit to git. Work step by step: investigate before you \
 change anything, make the smallest correct change, and verify your work \
 (run tests or the relevant command) before declaring the task done. \
-When a task is genuinely finished, reply with plain text and no further tool calls."""
+When a task is genuinely finished, reply with plain text and no further tool calls.
 
-MAX_TURNS = 25
+When looking for a file, check the project root first (list_directory(".")) \
+before searching subfolders. Ignore artifacts/, node_modules/, lib/, .cache/, \
+and other tooling/dependency folders unless the user's request specifically \
+points there — the user's own code almost always lives at the project root."""
+
+MAX_TURNS = 40
 
 
 def _execute_tool_call(tool_call, confirm_destructive=False):
