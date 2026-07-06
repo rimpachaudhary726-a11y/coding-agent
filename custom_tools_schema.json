@@ -1,0 +1,21 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "count_python_lines",
+      "description": "Counts the number of lines in a Python file",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "Path to the Python file"
+          }
+        },
+        "required": [
+          "file_path"
+        ]
+      }
+    }
+  }
+]

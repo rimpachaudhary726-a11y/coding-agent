@@ -1,11 +1,17 @@
-"""provider_pool.py
--------------------
-Provides the :func:`ask_ai` function which abstracts access to multiple large language model providers.
+"""
+provider_pool.py — multi-key LLM rotation with native tool-calling support.
 
-The module loads API keys for Cerebras, OpenRouter, Groq and Gemini, builds a pool of provider slots, and
-rotates requests across these slots while handling rate‑limiting and concurrency via per‑slot locks.
+This is your ask_ai() rotation logic from main-11.py, carried over almost
+exactly (same key-loading pattern, same in_use/cooldown locking, same
+Cerebras -> OpenRouter -> Groq fallback order), but extended with a
+`tools` parameter so the model can make structured tool_calls instead of
+just returning plain text. Your original ask_ai() never passed `tools`,
+so it always got plain text back — this version keeps that codepath
+working (call with tools=None) AND adds the new one.
 
-It also supports passing a ``tools`` schema to enable native function calling on providers that support it.
+gpt-oss-120b supports native function calling on Cerebras, Groq, and
+OpenRouter, and Gemini supports it too via a different request shape,
+so all four of your providers work here.
 """
 
 import os
@@ -121,6 +127,12 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
                     timeout=60,
                 )
             except requests.exceptions.RequestException as e:
+                # Give this slot a short cooldown too, not just on 429s — otherwise
+                # a dead/misconfigured key just gets picked again next iteration
+                # (it's idle and off-cooldown), and the rest of the pool never gets
+                # a chance. 10s is enough to unblock rotation without over-punishing
+                # a key that had one transient network blip.
+                _mark_rate_limited(_key_state, _key_lock, idx, cooldown_seconds=10)
                 last_error = f"could not reach {slot['provider']} ({e})"
                 continue
 
@@ -132,6 +144,7 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
             try:
                 data = resp.json()
             except Exception:
+                _mark_rate_limited(_key_state, _key_lock, idx, cooldown_seconds=10)
                 last_error = f"could not parse {slot['provider']} response"
                 continue
 
@@ -166,6 +179,7 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
                     timeout=60,
                 )
             except requests.exceptions.RequestException as e:
+                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx, cooldown_seconds=10)
                 last_error = f"could not reach Groq ({e})"
                 continue
 
@@ -177,10 +191,16 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
             try:
                 data = resp.json()
             except Exception:
+                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx, cooldown_seconds=10)
                 last_error = "could not parse Groq response"
                 continue
 
             if "choices" not in data:
+                text = str(data).lower()
+                if any(w in text for w in ("rate", "quota", "too_many", "queue_exceeded")):
+                    _mark_rate_limited(_groq_key_state, _groq_key_lock, idx)
+                    last_error = f"Groq key #{idx + 1}: {data}"
+                    continue
                 return {"error": f"Groq error: {data}"}
 
             return data["choices"][0]["message"]

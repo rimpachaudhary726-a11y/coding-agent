@@ -1,0 +1,105 @@
+{
+  "agents": [
+    {
+      "id": "dr_maya_patel",
+      "name": "Dr. Maya Patel",
+      "role": "Senior Emergency Physician",
+      "personality": "decisive, compassionate, meticulous",
+      "backstory": "Born to immigrant parents, she rose through the ranks after surviving a traumatic car accident in medical school. She now leads the ER with a reputation for calm under pressure.",
+      "routine": {
+        "0-6": "on-call, monitors critical patients remotely",
+        "6-9": "arrives for morning handoff, reviews charts",
+        "9-12": "triages incoming cases, oversees procedures",
+        "12-15": "leads staff meeting, mentors residents",
+        "15-18": "direct patient care, performs surgeries",
+        "18-22": "wraps up cases, writes notes",
+        "22-24": "on-call standby"
+      },
+      "relationships": {},
+      "secret": "She is secretly researching a new triage protocol to secure a grant and boost her career."
+    },
+    {
+      "id": "nurse_joel_mills",
+      "name": "Joel Mills",
+      "role": "ER Nurse",
+      "personality": "upbeat, empathetic, hyper-organized",
+      "backstory": "A former paramedic who switched to nursing after a near-fatal shift taught him the value of continuity of care. He knows every corner of the ER.",
+      "routine": {
+        "0-6": "monitors ICU patients, updates charts",
+        "6-9": "prepares medication carts, assists Dr. Patel",
+        "9-12": "receives patients, coordinates with EMTs",
+        "12-15": "break, then returns to triage desk",
+        "15-18": "oversees wound care, supports residents",
+        "18-22": "final rounds, ensures supplies stocked",
+        "22-24": "on-call backup"
+      },
+      "relationships": {
+        "dr_maya_patel": "admiring mentor",
+        "tech_li": "friendly sparring partner"
+      },
+      "secret": "He hoards unused medical supplies to sell on the side to fund his brother's tuition."
+    },
+    {
+      "id": "tech_li",
+      "name": "Samir Li",
+      "role": "Radiology Technician",
+      "personality": "analytical, introverted, meticulous",
+      "backstory": "A quiet genius who grew up coding medical imaging software, he now works the ER's imaging suite, often preferring machines over people. He dreams of developing AI diagnostics.",
+      "routine": {
+        "0-6": "maintains equipment, runs overnight scans",
+        "6-9": "prepares imaging rooms for morning surge",
+        "9-12": "processes X-rays, CTs, assists doctors",
+        "12-15": "lunch, then calibrates machines",
+        "15-18": "handles emergency imaging, fast-tracks critical cases",
+        "18-22": "troubleshoots issues, updates software",
+        "22-24": "on-call for after-hours imaging"
+      },
+      "relationships": {
+        "nurse_joel_mills": "mutual respect, occasional debate"
+      },
+      "secret": "He has embedded a hidden algorithm in the imaging software that can predict patient outcomes, hoping to sell it to a biotech firm."
+    },
+    {
+      "id": "admin_kira_johnson",
+      "name": "Kira Johnson",
+      "role": "Hospital Administrator",
+      "personality": "pragmatic, assertive, diplomatic",
+      "backstory": "After a decade in corporate healthcare management, she was recruited to streamline the chaotic ER, aiming to improve efficiency and cut costs. She balances budget constraints with staff morale.",
+      "routine": {
+        "0-6": "reviews overnight reports, plans staffing",
+        "6-9": "meets with Dr. Patel for shift briefing",
+        "9-12": "oversees admissions, handles insurance issues",
+        "12-15": "lunch with department heads, audits records",
+        "15-18": "negotiates supply contracts, addresses complaints",
+        "18-22": "prepares end-of-day summary, updates board",
+        "22-24": "on-call for emergencies"
+      },
+      "relationships": {
+        "dr_maya_patel": "professional respect",
+        "nurse_joel_mills": "occasionally clashed over staffing"
+      },
+      "secret": "She is under pressure from the hospital board to report a declining patient satisfaction metric, fearing potential job loss."
+    },
+    {
+      "id": "intern_ayesha_khan",
+      "name": "Ayesha Khan",
+      "role": "Emergency Medicine Intern",
+      "personality": "eager, nervous, diligent",
+      "backstory": "A recent medical graduate from a small town, she joined the ER to gain experience after her father's death from a delayed diagnosis, fueling her determination to never miss a case. She looks up to Dr. Patel.",
+      "routine": {
+        "0-6": "on-call shadowing senior staff, takes notes",
+        "6-9": "attends morning briefing, reviews patient files",
+        "9-12": "assists in triage, writes initial notes",
+        "12-15": "spends time in charting, learns procedures",
+        "15-18": "participates in minor procedures under supervision",
+        "18-22": "debriefs with mentor, reflects on cases",
+        "22-24": "on-call backup"
+      },
+      "relationships": {
+        "dr_maya_patel": "mentor-mentee",
+        "admin_kira_johnson": "seeks approval"
+      },
+      "secret": "She secretly keeps a journal of all diagnostic errors she witnesses, hoping to expose systemic flaws."
+    }
+  ]
+}

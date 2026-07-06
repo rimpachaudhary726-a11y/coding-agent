@@ -1,0 +1,12 @@
+[
+  {
+    "text": "first event",
+    "tick": 0,
+    "importance": 5
+  },
+  {
+    "text": "second event",
+    "tick": 5,
+    "importance": 2
+  }
+]
