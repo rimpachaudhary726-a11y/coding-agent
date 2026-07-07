@@ -3,24 +3,23 @@
 cli.py — the installable entry point.
 
 Usage:
-    python cli.py                  interactive chat loop (real conversation memory)
-    python cli.py "fix the bug in auth.py"     one-shot task
-    python cli.py --plan "refactor the auth module"   plan mode: pauses for your
-                                                       approval before any write/edit/bash
+    python cli.py                              interactive chat loop (real conversation memory)
+    python cli.py "fix the bug in auth.py"     one-shot task, human-readable step output
 
-    # Unix piping:
-    echo "fix the bug in auth.py" | python cli.py
-    cat bug_report.txt | python cli.py "summarize and fix"
-    cat bug_report.txt | python cli.py         # piped content alone becomes the task
-    cat bug_report.txt | python cli.py --plan  # piped task, plan mode on
+Scripting / Unix-pipeline mode:
+    python cli.py -p "task"                    print mode — task + final result only, no
+                                                emoji/step noise, safe to pipe or redirect
+    python cli.py -p --json "task"             same, but result is a single JSON object on
+                                                stdout — for jq / other tools to parse
+    cat error.log | python cli.py -p "explain this"
+                                                stdin is piped in and appended to the task as
+                                                context automatically
+    git diff | python cli.py -p --json "review this diff" > review.json
 
-Diff-before-apply: whenever the agent stages changes with stage_write_file /
-stage_edit_file and then calls apply_pending_changes, you'll see the full
-diff here and be asked to approve, reject, or leave feedback before anything
-is written to disk.
-
-Project memory: if an AGENT.md (or CLAUDE.md) file exists in the current
-directory, it is auto-loaded and given to the agent as project context.
+Exit codes (only meaningful in -p mode; interactive mode always exits 0 on quit):
+    0   task completed without an ERROR result
+    1   task result started with "ERROR" (tool failure, bad args, LLM error, etc)
+    2   could not read stdin / bad CLI usage
 
 Setup: set your API keys as environment variables (or Replit Secrets):
     CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, ... CEREBRAS_API_KEY_9
@@ -28,8 +27,10 @@ Setup: set your API keys as environment variables (or Replit Secrets):
     OPENROUTER_API_KEY, OPENROUTER_API_KEY_2, OPENROUTER_API_KEY_3
 """
 
-import sys
+import argparse
 import json
+import sys
+import time
 from agent import run_agent, Conversation
 
 
@@ -53,11 +54,6 @@ def _print_step(step):
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-            if name in ("submit_plan", "apply_pending_changes"):
-                # Rendered separately/interactively by the approval prompts;
-                # skip here to avoid printing raw JSON twice.
-                continue
-
             print(f"   🔧 {name}({args})")
 
 
@@ -69,90 +65,70 @@ def _ask_confirmation(command):
     return answer == "y"
 
 
-def _ask_plan_approval(plan_text):
+def _read_piped_stdin():
     """
-    Shown when the agent calls submit_plan in plan mode.
-    Returns (approved: bool, feedback: str).
+    Returns piped stdin content as a string, or None if stdin is a real terminal
+    (i.e. nothing was piped in). Never blocks waiting for interactive input.
     """
-    print("\n📝 Proposed plan:")
-    print("   " + "\n   ".join(plan_text.strip().splitlines()))
-    answer = input("\n   Approve this plan? [y/N/feedback] ").strip()
-    if answer.lower() == "y":
-        return True, ""
-    if answer.lower() in ("n", ""):
-        return False, "Plan rejected, no specific feedback given — please reconsider your approach."
-    # Anything else typed is treated as feedback for a revision
-    return False, answer
-
-
-def _ask_diff_approval(diff_text):
-    """
-    Shown when the agent calls apply_pending_changes. Prints the full staged
-    diff across every file and asks for approval before anything is written.
-    Returns (approved: bool, feedback: str).
-    """
-    print("\n📄 Pending changes (nothing written to disk yet):\n")
-    print(diff_text)
-    answer = input("\n   Apply these changes? [y/N/feedback] ").strip()
-    if answer.lower() == "y":
-        return True, ""
-    if answer.lower() in ("n", ""):
-        return False, "Changes rejected, no specific feedback given."
-    return False, answer
-
-
-def _read_stdin_if_piped():
-    """Return piped stdin content, or None if stdin is a real terminal (no pipe)."""
     if sys.stdin.isatty():
         return None
-    data = sys.stdin.read().strip()
-    return data or None
+    try:
+        data = sys.stdin.read()
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"ERROR: could not read piped stdin: {e}", file=sys.stderr)
+        sys.exit(2)
+    return data if data.strip() else None
 
 
-def _parse_args(argv):
-    """Extract --plan flag and remaining task words from CLI args."""
-    plan_mode = False
-    task_words = []
-    for arg in argv:
-        if arg == "--plan":
-            plan_mode = True
-        else:
-            task_words.append(arg)
-    return plan_mode, " ".join(task_words)
+def _build_task_with_context(task, piped_context):
+    if not piped_context:
+        return task
+    return (
+        f"{task}\n\n"
+        f"--- piped input (from stdin) ---\n"
+        f"{piped_context}"
+    )
 
 
-def main():
-    plan_mode, cli_task = _parse_args(sys.argv[1:])
-    piped_input = _read_stdin_if_piped()
+def _run_print_mode(task, as_json, auto_confirm):
+    """
+    Non-interactive scripting mode: no step rendering, no confirmation prompts
+    (destructive commands are auto-declined unless auto_confirm is set, since
+    there's no human to ask), just the final result — either plain text or a
+    single JSON object on stdout.
+    """
+    started = time.time()
+    confirm_callback = None if auto_confirm else (lambda cmd: False)
 
-    shared_kwargs = {"diff_confirm_callback": _ask_diff_approval}
-    if plan_mode:
-        shared_kwargs["plan_mode"] = True
-        shared_kwargs["plan_confirm_callback"] = _ask_plan_approval
+    result = run_agent(task, on_step=None, auto_confirm=auto_confirm, confirm_callback=confirm_callback)
+    elapsed = round(time.time() - started, 2)
+    is_error = isinstance(result, str) and result.strip().upper().startswith("ERROR")
 
-    # Case 1: CLI arg task, possibly combined with piped context
-    if cli_task:
-        task = cli_task
-        if piped_input:
-            task = f"{task}\n\n---\n{piped_input}"
-        if plan_mode:
-            print("=== Coding Agent CLI (plan mode) ===")
-        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
-        print(f"\n✅ {result}")
-        return
+    if as_json:
+        print(json.dumps({
+            "task": task,
+            "result": result,
+            "elapsed_seconds": elapsed,
+            "error": is_error,
+        }))
+    else:
+        print(result)
 
-    # Case 2: no CLI arg, but stdin was piped — piped content IS the task
-    if piped_input:
-        print(f"=== Coding Agent CLI (piped input{', plan mode' if plan_mode else ''}) ===")
-        result = run_agent(piped_input, on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
-        print(f"\n✅ {result}")
-        return
+    sys.exit(1 if is_error else 0)
 
-    # Case 3: normal interactive mode
-    print("=== Coding Agent CLI ===" + (" (plan mode)" if plan_mode else ""))
+
+def _run_one_shot_human(task):
+    result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
+    print(f"\n✅ {result}")
+    is_error = isinstance(result, str) and result.strip().upper().startswith("ERROR")
+    sys.exit(1 if is_error else 0)
+
+
+def _run_interactive():
+    print("=== Coding Agent CLI ===")
     print("Type your task, or 'quit' to exit.\n")
 
-    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
+    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
 
     while True:
         try:
@@ -166,11 +142,59 @@ def main():
             print("bye")
             break
         if task.lower() == "new":
-            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
+            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
             print("(started a fresh conversation)")
             continue
         result = conversation.send(task)
         print(f"\n✅ {result}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Coding agent — interactive by default, scriptable with -p.",
+        add_help=True,
+    )
+    parser.add_argument("task", nargs="*", help="the task to run (omit for interactive mode)")
+    parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
+                         help="non-interactive scripting mode: no step noise, safe to pipe")
+    parser.add_argument("--json", action="store_true",
+                         help="with -p, emit a single JSON object on stdout instead of plain text")
+    parser.add_argument("--auto-confirm", action="store_true",
+                         help="with -p, auto-approve destructive commands instead of auto-declining "
+                              "them (there's no human to ask in script mode — default is safe/decline)")
+    args = parser.parse_args()
+
+    piped_context = _read_piped_stdin()
+    task_text = " ".join(args.task).strip()
+
+    if args.json and not args.print_mode:
+        print("ERROR: --json only applies with -p/--print.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.print_mode:
+        if not task_text and not piped_context:
+            print("ERROR: -p/--print needs a task argument or piped stdin.", file=sys.stderr)
+            sys.exit(2)
+        final_task = _build_task_with_context(task_text or "Analyze the following input.", piped_context)
+        _run_print_mode(final_task, as_json=args.json, auto_confirm=args.auto_confirm)
+        return  # unreachable — _run_print_mode calls sys.exit()
+
+    # Non-print modes below always go through human-readable rendering.
+    if task_text or piped_context:
+        final_task = _build_task_with_context(task_text or "Analyze the following input.", piped_context)
+        _run_one_shot_human(final_task)
+        return
+
+    if not sys.stdin.isatty():
+        # Piped stdin but no interactive terminal available and no -p given —
+        # can't fall back to input() prompts, so treat it as one-shot instead
+        # of hanging forever waiting for a TTY that isn't there.
+        print("ERROR: input is piped but no task was given and stdin isn't a terminal. "
+              "Use -p for scripting mode, e.g.: cat file | python cli.py -p \"task\"",
+              file=sys.stderr)
+        sys.exit(2)
+
+    _run_interactive()
 
 
 if __name__ == "__main__":
