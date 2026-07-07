@@ -18,9 +18,7 @@
 
     (async () => {
   
-      await initRapier();
-console.log('Rapier initialized');
-      const RAPIER = rapier; // global provided by Rapier init script
+      const statusDiv = document.getElementById('status');
 
       // ----- Three.js setup -----
       const scene = new THREE.Scene();
@@ -47,7 +45,14 @@ console.log('Rapier initialized');
       const groundMesh = new THREE.Mesh(groundGeo, groundMat);
       groundMesh.position.y = -0.5; // align with physics ground
       scene.add(groundMesh);
-console.log('Three.js initialized');
+      statusDiv.textContent += ' → Three.js initialized';
+
+      // Initialize Rapier
+      await initRapier();
+      statusDiv.textContent += ' → Rapier initialized';
+
+      const RAPIER = rapier; // global provided by Rapier init script
+
 
       // Ground plane already created as groundMesh
 
@@ -82,7 +87,7 @@ console.log('Three.js initialized');
       // ----- Rapier physics setup -----
       const gravity = new RAPIER.Vector3(0, -9.81, 0);
       const world = new RAPIER.World(gravity);
-console.log('Rapier world created');
+statusDiv.textContent += ' → Rapier world created';
 
       // Static ground collider (matches ground mesh)
       const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0);

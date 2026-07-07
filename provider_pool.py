@@ -48,13 +48,23 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
 
 
+PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "cerebras,openrouter").split(",")]
+
+
 def _build_pool():
-    """Same idea as _build_provider_pool() in main-11.py: one slot per key,
-    Cerebras first (fastest), then OpenRouter, pooled together as
-    interchangeable rotation slots. Groq stays a separate fallback tier,
-    same as your original design."""
-    pool = [{"provider": "cerebras", "key": k, "model": CEREBRAS_MODEL} for k in CEREBRAS_KEYS]
-    pool += [{"provider": "openrouter", "key": k, "model": OPENROUTER_MODEL} for k in OPENROUTER_KEYS]
+    """
+    Builds the rotation pool in the order given by PROVIDER_ORDER (a Secret,
+    comma-separated, e.g. "openrouter,cerebras"). Defaults to Cerebras first
+    (fastest) then OpenRouter, same as before — set PROVIDER_ORDER to
+    "openrouter,cerebras" to make OpenRouter primary and Cerebras the
+    fallback within this tier instead. Groq stays a separate fallback tier
+    below this pool regardless of the order here, same as the original design.
+    """
+    provider_keys = {"cerebras": (CEREBRAS_KEYS, CEREBRAS_MODEL), "openrouter": (OPENROUTER_KEYS, OPENROUTER_MODEL)}
+    pool = []
+    for provider_name in PROVIDER_ORDER:
+        keys, model = provider_keys.get(provider_name, ([], None))
+        pool += [{"provider": provider_name, "key": k, "model": model} for k in keys]
     return pool
 
 
