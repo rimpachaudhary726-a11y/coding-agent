@@ -1,0 +1,2509 @@
+# Coding Agent — Complete Overview
+
+A self-directing coding agent that reads, writes, edits, and runs code via LLM tool-calling. It rotates across multiple API providers, maintains persistent memory across sessions, supports parallel fan-out for multi-file tasks, can create its own new tools at runtime, and ships with a full N-agent simulation engine.
+
+---
+
+## Table of Contents
+
+1. [Project Structure](#project-structure)
+2. [cli.py — Entry Point](#clipy--entry-point)
+3. [agent.py — Core Loop](#agentpy--core-loop)
+4. [tools.py — Built-in Tools](#toolspy--built-in-tools)
+5. [provider_pool.py — LLM Rotation](#provider_poolpy--llm-rotation)
+6. [task_memory.py — Cross-Session Memory](#task_memorypy--cross-session-memory)
+7. [custom_tool_registry.py — Self-Created Tools](#custom_tool_registrypy--self-created-tools)
+8. [custom_tools.py — Agent-Created Tools](#custom_toolspy--agent-created-tools)
+9. [firebase_tools.py — Firebase Scaffolding](#firebase_toolspy--firebase-scaffolding)
+10. [github_tools.py — GitHub Integration](#github_toolspy--github-integration)
+11. [meta_builder.py — Simulation Generator](#meta_builderpy--simulation-generator)
+12. [tick_engine.py — Simulation Runtime](#tick_enginepy--simulation-runtime)
+13. [memory.py — Per-Agent Memory Store](#memorypy--per-agent-memory-store)
+14. [director.py — Event Injection](#directorpy--event-injection)
+15. [Utility Files](#utility-files)
+    - [calc.py](#calcpy)
+    - [greeter.py](#greeterpy)
+    - [mathutils.py](#mathutilspy)
+    - [shapes.py](#shapespy)
+    - [test_calc.py](#test_calcpy)
+16. [Environment Variables](#environment-variables)
+17. [Full System Architecture](#full-system-architecture)
+
+---
+
+## Project Structure
+
+```
+.
+├── cli.py                    # User-facing entry point
+├── agent.py                  # Core LLM reasoning loop + fan-out
+├── tools.py                  # All built-in tool implementations
+├── provider_pool.py          # Multi-key LLM rotation (Cerebras → OpenRouter → Groq)
+├── task_memory.py            # Persistent cross-session memory + semantic retrieval
+├── custom_tool_registry.py   # Agent self-creates, validates, and saves new tools
+├── custom_tools.py           # Auto-generated — tools the agent has built itself
+├── firebase_tools.py         # Generates Firebase auth + Firestore boilerplate
+├── github_tools.py           # Git push, branch, PR, issue listing via REST API
+├── meta_builder.py           # Generates a full N-agent simulation from one prompt
+├── tick_engine.py            # Simulation tick loop (one hour per tick)
+├── memory.py                 # Per-agent JSON memory store for the simulation
+├── director.py               # Inject world/personal events into a running simulation
+├── calc.py                   # Utility: safe division function (agent-written example)
+├── greeter.py                # Utility: greeting helper (agent-written example)
+├── mathutils.py              # Utility: math helpers (agent-written example)
+├── shapes.py                 # Utility: Circle and Square classes (agent-written example)
+├── test_calc.py              # Unit tests for calc.py
+└── requirements.txt          # Python dependencies (requests)
+```
+
+---
+
+## cli.py — Entry Point
+
+The user-facing CLI. Supports interactive multi-turn chat and one-shot task execution.
+
+### Usage
+
+```bash
+# Interactive — full conversation memory across turns
+python cli.py
+
+# One-shot — run once, exit
+python cli.py "refactor auth.py to use bcrypt"
+```
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Interactive mode** | `Conversation` object — message history grows across turns |
+| **One-shot mode** | `run_agent()` — fresh context, exits after task completes |
+| **Live step rendering** | Streams every agent turn (tool calls + text) to the terminal |
+| **Todo display** | `write_todos` rendered as a plan checklist with ☐ ◐ ☑ icons |
+| **Destructive confirmation** | Pauses and asks the human before any dangerous shell command |
+| **`new` command** | Resets the conversation without restarting the process |
+| **Clean exit** | Handles `EOFError` and `KeyboardInterrupt` gracefully |
+
+### Full Code
+
+```python
+#!/usr/bin/env python3
+"""
+cli.py — the installable entry point.
+
+Usage:
+    python cli.py                  interactive chat loop (real conversation memory)
+    python cli.py "fix the bug in auth.py"     one-shot task (no follow-up context needed)
+
+Setup: set your API keys as environment variables (or Replit Secrets):
+    CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, ... CEREBRAS_API_KEY_9
+    GROQ_API_KEY
+    OPENROUTER_API_KEY, OPENROUTER_API_KEY_2, OPENROUTER_API_KEY_3
+"""
+
+import sys
+import json
+from agent import run_agent, Conversation
+
+
+def _print_step(step):
+    if step["content"]:
+        print(f"\n🤖 {step['content']}")
+    if step["tool_calls"]:
+        for tc in step["tool_calls"]:
+            fn = tc.get("function") if isinstance(tc, dict) else tc.function
+            name = fn.get("name") if isinstance(fn, dict) else fn.name
+            args = fn.get("arguments") if isinstance(fn, dict) else fn.arguments
+
+            if name == "write_todos":
+                try:
+                    todos = json.loads(args).get("todos", [])
+                    print("\n📋 Plan:")
+                    marker = {"pending": "☐", "in_progress": "◐", "completed": "☑"}
+                    for item in todos:
+                        print(f"   {marker.get(item.get('status'), '☐')} {item.get('content', '')}")
+                    continue
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+            print(f"   🔧 {name}({args})")
+
+
+def _ask_confirmation(command):
+    """Real pause — asks you directly before a destructive command runs."""
+    print(f"\n⚠️  About to run a potentially destructive command:")
+    print(f"   {command}")
+    answer = input("   Allow this? [y/N] ").strip().lower()
+    return answer == "y"
+
+
+def main():
+    print("=== Coding Agent CLI ===")
+    print("Type your task, or 'quit' to exit.\n")
+
+    if len(sys.argv) > 1:
+        task = " ".join(sys.argv[1:])
+        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
+        print(f"\n✅ {result}")
+        return
+
+    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
+
+    while True:
+        try:
+            task = input("\nyou > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye")
+            break
+        if not task:
+            continue
+        if task.lower() in ("quit", "exit"):
+            print("bye")
+            break
+        if task.lower() == "new":
+            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
+            print("(started a fresh conversation)")
+            continue
+        result = conversation.send(task)
+        print(f"\n✅ {result}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## agent.py — Core Loop
+
+The reasoning engine. Sends conversation + tool schema to the LLM, executes tool calls, feeds results back in, repeats until the model produces plain text or `MAX_TURNS` (40) is hit.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Tool-calling loop** | Up to 40 LLM ↔ tool execution turns per task |
+| **`run_agent()`** | Single-shot runner — fresh conversation per call |
+| **`Conversation` class** | Stateful multi-turn session, message history grows across turns |
+| **Fan-out** | Parallel `run_agent()` per target via `ThreadPoolExecutor` |
+| **Task memory** | Injects relevant past summaries; saves a new one when done |
+| **Custom tool loading** | Loads agent-created tools from `custom_tools.py` at startup |
+| **Live tool refresh** | After `create_tool`, new tool usable on the very next turn |
+| **Empty-response guard** | Detects truncated/stalled LLM responses and nudges the model |
+| **Firebase integration** | `scaffold_firebase_app` merged from `firebase_tools.py` |
+| **GitHub integration** | `git_push`, `create_branch`, `open_pull_request`, `list_open_issues` |
+| **Meta-builder** | `build_agent_system` generates complete N-agent simulation systems |
+
+### System Prompt Rules
+
+The agent is instructed to:
+- Investigate before changing anything; make the smallest correct change
+- Check the project root first before searching subfolders
+- Use `write_todos` for tasks with 3+ distinct steps
+- Run tests before declaring a task done
+- Use `revert_file` when an edit makes things worse
+- Create new tools only when no existing tool can do the job
+- Build a diagnostic tool rather than guess blindly on stubborn bugs
+
+### Full Code
+
+```python
+"""
+agent.py — the core reasoning loop, plus fan-out for big tasks.
+"""
+
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from provider_pool import ask_ai
+from tools import TOOL_SCHEMA, TOOL_FUNCTIONS, _matches_any, _DESTRUCTIVE_PATTERNS
+from firebase_tools import FIREBASE_TOOL_SCHEMA, FIREBASE_TOOL_FUNCTIONS
+from github_tools import GITHUB_TOOL_SCHEMA, GITHUB_TOOL_FUNCTIONS
+from meta_builder import build_agent_system
+from custom_tool_registry import CREATE_TOOL_SCHEMA, CREATE_TOOL_FUNCTIONS, load_custom_tools
+import task_memory
+
+META_BUILDER_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "build_agent_system",
+        "description": "Generate a complete N-agent simulation system (personas with personality/"
+                        "routine/relationships/secrets, memory storage, tick loop, and a live web "
+                        "viewer) for a given theme. Use this when asked to build a multi-agent "
+                        "simulation, agent society, or agent town for any theme.",
+        "parameters": {"type": "object", "properties": {
+            "theme": {"type": "string", "description": "e.g. 'a hospital emergency room', 'a space station crew'"},
+            "count": {"type": "integer", "default": 30},
+            "output_dir": {"type": "string", "default": "."},
+        }, "required": ["theme"]},
+    }},
+]
+META_BUILDER_TOOL_FUNCTIONS = {"build_agent_system": build_agent_system}
+
+# Load any tools the agent has created for itself in past sessions
+_custom_schema, _custom_functions, _custom_load_errors = load_custom_tools()
+for _err in _custom_load_errors:
+    print(f"[custom tools] {_err}")
+
+TOOL_SCHEMA = (
+    TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA + GITHUB_TOOL_SCHEMA
+    + META_BUILDER_TOOL_SCHEMA + CREATE_TOOL_SCHEMA + _custom_schema
+)
+TOOL_FUNCTIONS = {
+    **TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS,
+    **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **_custom_functions,
+}
+
+
+def _refresh_custom_tools():
+    """Hot-reload after create_tool — new tool usable on the very next turn."""
+    schema_list, functions, errors = load_custom_tools()
+    existing_names = {entry["function"]["name"] for entry in TOOL_SCHEMA}
+    for entry in schema_list:
+        name = entry["function"]["name"]
+        if name not in existing_names:
+            TOOL_SCHEMA.append(entry)
+    TOOL_FUNCTIONS.update(functions)
+    return errors
+
+
+SYSTEM_PROMPT = """You are a coding agent with direct access to the filesystem \
+and shell via tools. You can read, write, and edit files, search the codebase, \
+run commands, and commit to git. Work step by step: investigate before you \
+change anything, make the smallest correct change, and verify your work \
+(run tests or the relevant command) before declaring the task done. \
+When a task is genuinely finished, reply with plain text and no further tool calls.
+
+When looking for a file, check the project root first (list_directory(".")) \
+before searching subfolders. Ignore artifacts/, node_modules/, lib/, .cache/, \
+and other tooling/dependency folders unless the user's request specifically \
+points there — the user's own code almost always lives at the project root.
+
+If the project has a test suite, call detect_and_run_tests after making code \
+changes, before declaring the task done — don't just assume a fix works.
+
+If a task genuinely needs a capability none of your existing tools provide \
+(not just a task that's hard — one where no combination of existing tools \
+can do it), use create_tool to write and permanently save a new one. Prefer \
+existing tools whenever they can do the job; only create a new tool when \
+truly necessary, since every tool you create persists for all future tasks.
+
+If you're stuck on a bug after a few real attempts — you can reproduce it \
+but can't tell why it's happening — consider whether a diagnostic tool \
+would help (e.g. one that traces variable values, generates edge-case test \
+inputs, or diffs behavior before/after a change) rather than continuing to \
+guess blindly. Build that tool, use it to actually see what's happening, \
+then fix the real cause. Don't create a tool as a substitute for reasoning \
+about a bug you already understand well enough to fix directly.
+
+For any task with 3 or more distinct steps, call write_todos first to lay \
+out the plan, then update it as steps complete — this gives the person a \
+visible view of progress instead of a silent chain of actions. Skip it for \
+simple one- or two-step tasks; it adds noise there, not clarity.
+
+If an edit makes things worse — tests that were passing now fail, or you've \
+introduced an error that wasn't there before, and a quick follow-up fix \
+isn't working — use revert_file to get back to the last known-good state \
+before trying a different approach, rather than layering more changes on \
+top of a broken one. Only works on files already tracked by git; check the \
+result and fall back to fixing forward if revert isn't available."""
+
+MAX_TURNS = 40
+
+
+def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None):
+    name = tool_call["function"]["name"]
+    try:
+        args = json.loads(tool_call["function"]["arguments"] or "{}")
+    except json.JSONDecodeError:
+        return f"ERROR: could not parse arguments for {name}"
+
+    func = TOOL_FUNCTIONS.get(name)
+    if not func:
+        return f"ERROR: unknown tool '{name}'"
+
+    if name == "run_bash":
+        command = args.get("command", "")
+        if confirm_destructive:
+            args["confirmed"] = True
+        elif confirm_callback and _matches_any(command.strip(), _DESTRUCTIVE_PATTERNS):
+            allowed = confirm_callback(command)
+            if allowed:
+                args["confirmed"] = True
+            else:
+                return f"Command declined by user: '{command}'. Not run. Try a different approach."
+
+    try:
+        result = func(**args)
+    except TypeError as e:
+        return f"ERROR: bad arguments for {name}: {e}"
+    except Exception as e:
+        return f"ERROR: {name} raised an exception: {e}"
+
+    if name == "create_tool" and isinstance(result, str) and result.startswith("Tool '"):
+        refresh_errors = _refresh_custom_tools()
+        if refresh_errors:
+            result += f"\n(Note: {'; '.join(refresh_errors)})"
+
+    return result
+
+
+def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
+    """
+    Single-shot task runner. Each call starts a fresh conversation.
+    use_memory=False for fan-out leaves to avoid parallel writes to .agent_memory.json.
+    """
+    memory_context = ""
+    if use_memory:
+        relevant = task_memory.retrieve_relevant(task)
+        memory_context = task_memory.format_for_prompt(relevant)
+
+    system_content = SYSTEM_PROMPT
+    if memory_context:
+        system_content += "\n\n" + memory_context
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": task},
+    ]
+
+    final = _run_loop(messages, on_step, auto_confirm, confirm_callback)
+    if use_memory:
+        task_memory.add_task_summary(task, final)
+    return final
+
+
+class Conversation:
+    """
+    Stateful multi-turn session. Message history grows across turns so
+    follow-up messages build on what was just discussed, instead of
+    starting blind like separate run_agent() calls would.
+
+    Memory applied once at conversation start (on the first message),
+    then the growing history itself carries context for later turns.
+    """
+
+    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
+        self.on_step = on_step
+        self.auto_confirm = auto_confirm
+        self.confirm_callback = confirm_callback
+        self.use_memory = use_memory
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._memory_applied = False
+        self._first_task = None
+
+    def send(self, task):
+        """Send a new message in this ongoing conversation, get the reply."""
+        if not self._memory_applied and self.use_memory:
+            relevant = task_memory.retrieve_relevant(task)
+            memory_context = task_memory.format_for_prompt(relevant)
+            if memory_context:
+                self.messages[0]["content"] += "\n\n" + memory_context
+            self._memory_applied = True
+            self._first_task = task
+
+        self.messages.append({"role": "user", "content": task})
+        final = _run_loop(self.messages, self.on_step, self.auto_confirm, self.confirm_callback)
+        self.messages.append({"role": "assistant", "content": final})
+
+        if self.use_memory:
+            task_memory.add_task_summary(self._first_task or task, final)
+
+        return final
+
+
+def _run_loop(messages, on_step, auto_confirm, confirm_callback):
+    """Shared tool-calling loop used by run_agent() and Conversation.send()."""
+    consecutive_empty = 0
+
+    for turn in range(MAX_TURNS):
+        message = ask_ai(messages, tools=TOOL_SCHEMA)
+
+        if isinstance(message, dict) and "error" in message:
+            return f"ERROR: {message['error']}"
+
+        content = message.get("content") if isinstance(message, dict) else message.content
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
+
+        if on_step:
+            on_step({"turn": turn, "content": content, "tool_calls": tool_calls})
+
+        if not tool_calls:
+            if not content or not content.strip():
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    return "ERROR: model returned empty responses repeatedly — task did not complete. Try again or break the task into smaller steps."
+                messages.append({"role": "assistant", "content": content or ""})
+                messages.append({
+                    "role": "user",
+                    "content": "Your last response was empty. Please continue: either call a tool to keep working, or give a real final answer.",
+                })
+                continue
+            return content
+
+        consecutive_empty = 0
+
+        messages.append({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls,
+        })
+
+        for tc in tool_calls:
+            tc_dict = tc if isinstance(tc, dict) else {
+                "id": tc.id,
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            result = _execute_tool_call(
+                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc_dict["id"],
+                "content": str(result)[:6000],
+            })
+
+    return "Reached max turns without finishing — task may be too large for one run."
+
+
+def fan_out(task_template, targets, max_workers=8, auto_confirm=True):
+    """
+    Run run_agent() in parallel across many targets.
+
+    Example:
+        fan_out("Review {target} for bugs and list any you find.",
+                ["auth.py", "payments.py", "db.py"])
+
+    Returns {target: result} for all targets.
+    use_memory=False on leaves avoids many parallel writers hitting
+    the same .agent_memory.json at once.
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_target = {
+            executor.submit(
+                run_agent, task_template.format(target=t),
+                None, auto_confirm, None, False
+            ): t
+            for t in targets
+        }
+        for future in as_completed(future_to_target):
+            target = future_to_target[future]
+            try:
+                results[target] = future.result()
+            except Exception as e:
+                results[target] = f"ERROR: {e}"
+    return results
+```
+
+---
+
+## tools.py — Built-in Tools
+
+Every built-in action the agent can take. All registered in `TOOL_SCHEMA` (OpenAI-compatible format).
+
+### Tool Summary
+
+| Tool | Description |
+|---|---|
+| `read_file` | Read a file; optional line range to save tokens |
+| `write_file` | Atomic write via temp file + `os.replace()` — crash-safe |
+| `edit_file` | Targeted find-and-replace; requires exactly one match |
+| `read_files` | Read multiple files in one call; caps combined output at 20 000 chars |
+| `list_directory` | List files and folders at a path |
+| `search_codebase` | Grep-style text or regex search across all files under a directory |
+| `run_bash` | Run any shell command with soft/hard safety blocks |
+| `revert_file` | `git checkout -- <path>` — undo a bad edit |
+| `detect_and_run_tests` | Auto-detect and run pytest or npm test |
+| `write_todos` | Create/update a visible task checklist |
+| `git_commit` | Stage all changes and commit (injection-safe subprocess list) |
+
+### Safety Model
+
+**Soft blocks** — require human approval before running:
+```
+rm -rf          git push --force    git reset --hard
+drop table      mkfs                dd if=
+> /dev/sd*      chmod -R 777        :(){  (fork bomb)
+```
+
+**Hard blocks** — never run, regardless of confirmation:
+```
+rm -rf /     rm -rf /*     mkfs.*     fork bomb variant
+```
+
+### Full Code
+
+```python
+"""
+tools.py — the actions the agent can actually take.
+"""
+
+import os
+import re
+import subprocess
+import json
+import difflib
+
+
+def read_file(path, line_start=None, line_end=None):
+    """
+    Reads a file. If line_start/line_end are given (1-indexed, inclusive),
+    returns only that range — cheaper on large files.
+    """
+    if not os.path.exists(path):
+        return f"ERROR: {path} does not exist."
+    try:
+        with open(path, "r") as f:
+            if line_start is None and line_end is None:
+                return f.read()
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        return f"ERROR: {path} is not a text file (binary content)."
+
+    start = max((line_start or 1) - 1, 0)
+    end = line_end if line_end is not None else len(lines)
+    selected = lines[start:end]
+    if not selected:
+        return f"ERROR: line range {line_start}-{line_end} is out of bounds for {path} ({len(lines)} lines total)."
+    return "".join(selected)
+
+
+def write_file(path, content):
+    """Atomic write — same crash-safety pattern: temp file + os.replace()."""
+    tmp_path = path + ".tmp" + str(os.getpid())
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+    with open(tmp_path, "w") as f:
+        f.write(content)
+    os.replace(tmp_path, path)
+    return f"Wrote {len(content)} chars to {path}."
+
+
+def edit_file(path, old_text, new_text):
+    """Targeted find-and-replace. old_text must match EXACTLY ONCE."""
+    if not os.path.exists(path):
+        return f"ERROR: {path} does not exist."
+    content = read_file(path)
+    occurrences = content.count(old_text)
+    if occurrences == 0:
+        return f"Could not find that exact text in {path}. No changes made. " \
+               f"Tip: view the file first to copy the exact text to replace."
+    if occurrences > 1:
+        return f"ERROR: that text appears {occurrences} times in {path} — edit_file " \
+               f"requires an exact, unique match. Include more surrounding context to " \
+               f"make old_text unique, then try again."
+    new_content = content.replace(old_text, new_text)
+    write_file(path, new_content)
+    diff_preview = "\n".join(
+        list(difflib.unified_diff(
+            content.splitlines(), new_content.splitlines(),
+            lineterm="", n=1
+        ))[:20]
+    )
+    return f"Edited {path}.\n{diff_preview}"
+
+
+def list_directory(path="."):
+    if not os.path.exists(path):
+        return f"ERROR: {path} does not exist."
+    entries = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        entries.append(("[dir] " if os.path.isdir(full) else "      ") + name)
+    return "\n".join(entries) if entries else "(empty directory)"
+
+
+def search_codebase(query, root=".", extensions=None, use_regex=False):
+    r"""Grep-style search across text files under root. extensions e.g. [".py", ".js"].
+    If use_regex is True, query is treated as a regular expression."""
+    matches = []
+    pattern = None
+    if use_regex:
+        try:
+            pattern = re.compile(query)
+        except re.error as e:
+            return f"ERROR: invalid regex '{query}': {e}"
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv", "venv")]
+        for fname in filenames:
+            if extensions and not any(fname.endswith(ext) for ext in extensions):
+                continue
+            full = os.path.join(dirpath, fname)
+            try:
+                with open(full, "r", errors="ignore") as f:
+                    for lineno, line in enumerate(f, 1):
+                        is_match = pattern.search(line) if pattern else query.lower() in line.lower()
+                        if is_match:
+                            matches.append(f"{full}:{lineno}: {line.strip()}")
+            except (UnicodeDecodeError, PermissionError, OSError):
+                continue
+            if len(matches) >= 100:
+                return "\n".join(matches) + "\n... (truncated at 100 matches)"
+    return "\n".join(matches) if matches else f"No matches found for '{query}'."
+
+
+_DESTRUCTIVE_PATTERNS = [
+    r"\brm\s+-rf\b", r"\bgit\s+push\s+--force\b", r"\bgit\s+reset\s+--hard\b",
+    r"\bdrop\s+table\b", r"\bmkfs\b", r"\bdd\s+if=", r">\s*/dev/sd",
+    r"\bchmod\s+-R\s+777\b", r":\(\)\{",
+]
+
+_HARD_BLOCKED_PATTERNS = [
+    r"\brm\s+-rf\s+/\s*$", r"\brm\s+-rf\s+/\*", r"\bmkfs\.", r":\(\)\{\s*:\|:&\s*\};:",
+]
+
+
+def _matches_any(command, patterns):
+    return any(re.search(p, command) for p in patterns)
+
+
+def run_bash(command, confirmed=False, timeout=60):
+    """
+    Runs a shell command. Destructive-looking commands require confirmed=True.
+    A small set of catastrophic patterns are hard-blocked no matter what.
+    """
+    stripped = command.strip()
+    if not stripped:
+        return "Empty command, nothing to run."
+
+    if _matches_any(stripped, _HARD_BLOCKED_PATTERNS):
+        return "BLOCKED: this command matches a hard safety block and will never be run."
+
+    if _matches_any(stripped, _DESTRUCTIVE_PATTERNS) and not confirmed:
+        return (f"CONFIRMATION_REQUIRED: '{stripped}' looks destructive. "
+                f"Re-run with confirmation if you're sure.")
+
+    try:
+        result = subprocess.run(
+            stripped, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {timeout}s."
+
+    output = (result.stdout or "") + (result.stderr or "")
+    output = output[-4000:]
+    return f"(exit code {result.returncode})\n{output}"
+
+
+def read_files(paths):
+    """Read multiple files in one call. Caps combined output at 20 000 chars."""
+    if not isinstance(paths, list) or not paths:
+        return "ERROR: paths must be a non-empty list of file paths."
+
+    sections = []
+    total_len = 0
+    for path in paths:
+        content = read_file(path)
+        total_len += len(content)
+        if total_len > 20000:
+            sections.append(f"=== {path} ===\n(skipped — combined batch size limit reached)")
+            continue
+        sections.append(f"=== {path} ===\n{content}")
+    return "\n\n".join(sections)
+
+
+def revert_file(path):
+    """Restore a file to its last git-committed state."""
+    if not os.path.exists(path):
+        return f"ERROR: {path} does not exist."
+
+    check = run_bash(f"git ls-files --error-unmatch {path}", confirmed=True)
+    if "exit code 0" not in check:
+        return f"ERROR: '{path}' is not tracked by git, nothing to revert to."
+
+    result = run_bash(f"git checkout -- {path}", confirmed=True)
+    if "exit code 0" not in result:
+        return f"ERROR: revert failed:\n{result}"
+    return f"Reverted {path} to its last committed state."
+
+
+def detect_and_run_tests(root="."):
+    """Auto-detect the project's test setup (pytest or npm test) and run it."""
+    has_pytest_config = os.path.exists(os.path.join(root, "pytest.ini")) or \
+        os.path.exists(os.path.join(root, "conftest.py"))
+    has_test_dir = os.path.isdir(os.path.join(root, "tests"))
+    has_test_files = any(
+        f.startswith("test_") or f.endswith("_test.py")
+        for f in os.listdir(root) if os.path.isfile(os.path.join(root, f))
+    ) if os.path.isdir(root) else False
+
+    if has_pytest_config or has_test_dir or has_test_files:
+        result = run_bash("python3 -m pytest -q", confirmed=True, timeout=120)
+        return f"Detected a pytest setup. Ran `python3 -m pytest -q`:\n{result}"
+
+    package_json = os.path.join(root, "package.json")
+    if os.path.exists(package_json):
+        try:
+            with open(package_json, "r") as f:
+                pkg = json.load(f)
+            if pkg.get("scripts", {}).get("test"):
+                result = run_bash("npm test", confirmed=True, timeout=120)
+                return f"Detected an npm test script. Ran `npm test`:\n{result}"
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return "No recognizable test setup found. Nothing was run."
+
+
+_VALID_STATUSES = {"pending", "in_progress", "completed"}
+
+
+def write_todos(todos):
+    """Create or update a visible task plan/checklist for the current work."""
+    if not isinstance(todos, list) or not todos:
+        return "ERROR: todos must be a non-empty list of {content, status} objects."
+
+    lines = []
+    for i, item in enumerate(todos):
+        if not isinstance(item, dict) or "content" not in item:
+            return f"ERROR: todo #{i} is missing 'content'."
+        status = item.get("status", "pending")
+        if status not in _VALID_STATUSES:
+            return f"ERROR: todo #{i} has invalid status '{status}' (must be pending/in_progress/completed)."
+        marker = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}[status]
+        lines.append(f"{marker} {item['content']}")
+
+    return "Plan updated:\n" + "\n".join(lines)
+
+
+def git_commit(message, add_all=True):
+    """Stage all changes and commit. Injection-safe: subprocess list, not shell string."""
+    if add_all:
+        add_result = run_bash("git add -A", confirmed=True)
+        if "exit code 0" not in add_result:
+            return f"git add failed:\n{add_result}"
+    try:
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "git commit timed out after 30s."
+    output = (result.stdout or "") + (result.stderr or "")
+    return f"(exit code {result.returncode})\n{output[-4000:]}"
+
+
+TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a file's contents. Optionally give line_start/line_end (1-indexed, "
+                        "inclusive) to read only part of a large file instead of the whole thing.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "line_start": {"type": "integer", "description": "First line to read (1-indexed), optional"},
+            "line_end": {"type": "integer", "description": "Last line to read (inclusive), optional"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Create a new file or completely overwrite an existing one with new content.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        }, "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "edit_file",
+        "description": "Make a targeted find-and-replace edit in an existing file. "
+                        "Prefer this over write_file for small changes to save tokens.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "old_text": {"type": "string", "description": "Exact text to find"},
+            "new_text": {"type": "string", "description": "Text to replace it with"},
+        }, "required": ["path", "old_text", "new_text"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_directory",
+        "description": "List files and folders at a given path (default current directory).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "default": "."}
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "search_codebase",
+        "description": "Search for a text string (or regex pattern) across all files under a directory.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+            "root": {"type": "string", "default": "."},
+            "extensions": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['.py', '.js']"},
+            "use_regex": {"type": "boolean", "default": False},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_files",
+        "description": "Read multiple files in one call instead of one call per file.",
+        "parameters": {"type": "object", "properties": {
+            "paths": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["paths"]},
+    }},
+    {"type": "function", "function": {
+        "name": "revert_file",
+        "description": "Restore a file to its last git-committed state, discarding uncommitted changes.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "run_bash",
+        "description": "Run a shell command (tests, builds, package installs, git, etc). "
+                        "Destructive commands will ask for confirmation.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"},
+        }, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "detect_and_run_tests",
+        "description": "Auto-detect the project's test setup (pytest or npm test) and run it.",
+        "parameters": {"type": "object", "properties": {
+            "root": {"type": "string", "default": "."}
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "write_todos",
+        "description": "Create or update a visible task plan/checklist for the current work. "
+                        "Call at the start of any multi-step task (3+ steps), then update statuses as steps complete.",
+        "parameters": {"type": "object", "properties": {
+            "todos": {
+                "type": "array",
+                "items": {"type": "object", "properties": {
+                    "content": {"type": "string"},
+                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                }, "required": ["content", "status"]},
+            },
+        }, "required": ["todos"]},
+    }},
+    {"type": "function", "function": {
+        "name": "git_commit",
+        "description": "Stage all changes and commit them with a message.",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string"},
+        }, "required": ["message"]},
+    }},
+]
+
+TOOL_FUNCTIONS = {
+    "read_file": read_file,
+    "read_files": read_files,
+    "write_file": write_file,
+    "edit_file": edit_file,
+    "revert_file": revert_file,
+    "list_directory": list_directory,
+    "search_codebase": search_codebase,
+    "run_bash": run_bash,
+    "detect_and_run_tests": detect_and_run_tests,
+    "write_todos": write_todos,
+    "git_commit": git_commit,
+}
+```
+
+---
+
+## provider_pool.py — LLM Rotation
+
+Manages multiple API keys across providers. Rotates slots automatically, cools down rate-limited keys, falls back through providers.
+
+### Priority Order
+
+```
+Cerebras (fastest)  →  OpenRouter  →  Groq (fallback)
+```
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Multi-key rotation** | Loads `KEY`, `KEY_2`, `KEY_3` … `KEY_N` automatically |
+| **Idle-first selection** | Prefers idle + off-cooldown; falls back to off-cooldown; last resort: soonest-free |
+| **429 cooldown** | Rate-limited slot gets 60s cooldown; network errors get 10s |
+| **Thread-safe** | `threading.Lock()` guards all slot state mutations |
+| **Tool-call passthrough** | Forwards `tools` + `tool_choice` to providers that support native function calling |
+| **Groq fallback tier** | If all primary slots fail, retries through every Groq key |
+| **Model overrides** | Env vars override the default model per provider |
+
+### Default Models
+
+| Provider | Default Model |
+|---|---|
+| Cerebras | `gpt-oss-120b` |
+| OpenRouter | `openai/gpt-oss-120b` |
+| Groq | `openai/gpt-oss-120b` |
+
+### Full Code
+
+```python
+"""
+provider_pool.py — multi-key LLM rotation with native tool-calling support.
+"""
+
+import os
+import time
+import threading
+import requests
+import json
+
+
+def _load_keys(env_prefix):
+    """Load <PREFIX>, then <PREFIX>_2, <PREFIX>_3, ... until one is missing."""
+    keys = []
+    primary = os.environ.get(env_prefix)
+    if primary:
+        keys.append(primary)
+    i = 2
+    while True:
+        k = os.environ.get(f"{env_prefix}_{i}")
+        if not k:
+            break
+        keys.append(k)
+        i += 1
+    return keys
+
+
+CEREBRAS_KEYS = _load_keys("CEREBRAS_API_KEY")
+GROQ_KEYS = _load_keys("GROQ_API_KEY")
+OPENROUTER_KEYS = _load_keys("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
+
+
+def _build_pool():
+    pool = [{"provider": "cerebras", "key": k, "model": CEREBRAS_MODEL} for k in CEREBRAS_KEYS]
+    pool += [{"provider": "openrouter", "key": k, "model": OPENROUTER_MODEL} for k in OPENROUTER_KEYS]
+    return pool
+
+
+PROVIDER_POOL = _build_pool()
+
+_key_lock = threading.Lock()
+_key_state = {i: {"cooldown_until": 0.0, "in_use": False} for i in range(len(PROVIDER_POOL))}
+_groq_key_lock = threading.Lock()
+_groq_key_state = {i: {"cooldown_until": 0.0, "in_use": False} for i in range(len(GROQ_KEYS))}
+
+
+def _pick_available_index(state, lock, pool_len):
+    """Prefer idle+off-cooldown → off-cooldown → soonest-free. Marks in_use atomically."""
+    now = time.time()
+    with lock:
+        not_cooling = [i for i in range(pool_len) if state[i]["cooldown_until"] <= now]
+        idle = [i for i in not_cooling if not state[i]["in_use"]]
+        if idle:
+            chosen = idle[0]
+        elif not_cooling:
+            chosen = not_cooling[0]
+        else:
+            chosen = min(range(pool_len), key=lambda i: state[i]["cooldown_until"])
+        state[chosen]["in_use"] = True
+        return chosen
+
+
+def _mark_rate_limited(state, lock, index, cooldown_seconds=60):
+    with lock:
+        state[index]["cooldown_until"] = time.time() + cooldown_seconds
+
+
+def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
+    """
+    Rotate across provider pool. Returns the raw message object,
+    or {"error": "..."} on total failure.
+    """
+    if not PROVIDER_POOL and not GROQ_KEYS:
+        return {"error": "No CEREBRAS_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY found in environment."}
+
+    last_error = "unknown failure"
+
+    for _ in range(len(PROVIDER_POOL)):
+        idx = _pick_available_index(_key_state, _key_lock, len(PROVIDER_POOL))
+        slot = PROVIDER_POOL[idx]
+        try:
+            url = (
+                "https://api.cerebras.ai/v1/chat/completions"
+                if slot["provider"] == "cerebras"
+                else "https://openrouter.ai/api/v1/chat/completions"
+            )
+            payload = {"model": slot["model"], "messages": messages, "max_tokens": max_tokens}
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = tool_choice
+            try:
+                resp = requests.post(
+                    url,
+                    headers={"Authorization": f"Bearer {slot['key']}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=60,
+                )
+            except requests.exceptions.RequestException as e:
+                _mark_rate_limited(_key_state, _key_lock, idx, cooldown_seconds=10)
+                last_error = f"could not reach {slot['provider']} ({e})"
+                continue
+
+            if resp.status_code == 429:
+                _mark_rate_limited(_key_state, _key_lock, idx)
+                last_error = f"rate limited on {slot['provider']} slot #{idx + 1}"
+                continue
+
+            try:
+                data = resp.json()
+            except Exception:
+                _mark_rate_limited(_key_state, _key_lock, idx, cooldown_seconds=10)
+                last_error = f"could not parse {slot['provider']} response"
+                continue
+
+            if "choices" not in data:
+                text = str(data).lower()
+                if any(w in text for w in ("rate", "quota", "too_many", "queue_exceeded")):
+                    _mark_rate_limited(_key_state, _key_lock, idx)
+                    last_error = f"{slot['provider']} slot #{idx + 1}: {data}"
+                    continue
+                return {"error": f"API error from {slot['provider']}: {data}"}
+
+            return data["choices"][0]["message"]
+
+        finally:
+            with _key_lock:
+                _key_state[idx]["in_use"] = False
+
+    # Groq fallback tier
+    for _ in range(len(GROQ_KEYS)):
+        idx = _pick_available_index(_groq_key_state, _groq_key_lock, len(GROQ_KEYS))
+        api_key = GROQ_KEYS[idx]
+        try:
+            payload = {"model": GROQ_MODEL, "messages": messages, "max_tokens": max_tokens}
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = tool_choice
+            try:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=60,
+                )
+            except requests.exceptions.RequestException as e:
+                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx, cooldown_seconds=10)
+                last_error = f"could not reach Groq ({e})"
+                continue
+
+            if resp.status_code == 429:
+                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx)
+                last_error = f"rate limited on Groq key #{idx + 1}"
+                continue
+
+            try:
+                data = resp.json()
+            except Exception:
+                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx, cooldown_seconds=10)
+                last_error = "could not parse Groq response"
+                continue
+
+            if "choices" not in data:
+                text = str(data).lower()
+                if any(w in text for w in ("rate", "quota", "too_many", "queue_exceeded")):
+                    _mark_rate_limited(_groq_key_state, _groq_key_lock, idx)
+                    last_error = f"Groq key #{idx + 1}: {data}"
+                    continue
+                return {"error": f"Groq error: {data}"}
+
+            return data["choices"][0]["message"]
+
+        finally:
+            with _groq_key_lock:
+                _groq_key_state[idx]["in_use"] = False
+
+    return {"error": last_error}
+```
+
+---
+
+## task_memory.py — Cross-Session Memory
+
+Persistent memory stored in `.agent_memory.json`. Every completed task gets a summary. New tasks retrieve the most relevant past summaries via semantic similarity.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Semantic retrieval** | Gemini embeddings + cosine similarity when `GEMINI_API_KEY` is set |
+| **Keyword fallback** | Word-overlap scoring when Gemini is unavailable |
+| **Tiered ranking** | Embedding-scored entries ranked above keyword-scored entries |
+| **Similarity floor** | Only returns entries with cosine similarity > 0.55 |
+| **Bounded storage** | Caps at 200 entries; oldest evicted automatically |
+| **Crash-safe writes** | Temp file + `os.replace()` |
+| **Prompt formatting** | `format_for_prompt()` produces a clean block for the system prompt |
+
+### Full Code
+
+```python
+"""
+task_memory.py — persistent memory across sessions, per project.
+"""
+
+import json
+import math
+import os
+import time
+import requests
+
+MEMORY_FILE = ".agent_memory.json"
+MAX_STORED = 200
+MAX_RETRIEVED = 5
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_EMBED_MODEL = "gemini-embedding-001"
+GEMINI_EMBED_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_EMBED_MODEL}:embedContent?key={{key}}"
+)
+
+
+def _embed(text):
+    """Returns an embedding vector for text, or None if unavailable/failed."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            GEMINI_EMBED_URL.format(key=GEMINI_API_KEY),
+            json={"model": f"models/{GEMINI_EMBED_MODEL}", "content": {"parts": [{"text": text}]}},
+            timeout=15,
+        )
+        data = resp.json()
+        return data.get("embedding", {}).get("values")
+    except (requests.exceptions.RequestException, ValueError, KeyError):
+        return None
+
+
+def _cosine_similarity(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _load(memory_path):
+    if not os.path.exists(memory_path):
+        return []
+    try:
+        with open(memory_path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save(memory_path, entries):
+    tmp = memory_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(entries[-MAX_STORED:], f, indent=2)
+    os.replace(tmp, memory_path)
+
+
+def add_task_summary(task, summary, memory_path=MEMORY_FILE):
+    """Append a completed task + its outcome to persistent memory."""
+    entries = _load(memory_path)
+    entries.append({
+        "task": task,
+        "summary": summary,
+        "timestamp": time.time(),
+        "embedding": _embed(task),
+    })
+    _save(memory_path, entries)
+
+
+def retrieve_relevant(task, memory_path=MEMORY_FILE, top_k=MAX_RETRIEVED):
+    """
+    Return the most relevant past entries for a new task.
+    Tier 1 (embedding cosine > 0.55) takes priority over Tier 0 (keyword overlap).
+    """
+    entries = _load(memory_path)
+    if not entries:
+        return []
+
+    query_embedding = _embed(task)
+    task_words = set(task.lower().split())
+
+    def score(entry):
+        if query_embedding and entry.get("embedding"):
+            sim = _cosine_similarity(query_embedding, entry["embedding"])
+            return (1, sim, entry["timestamp"])
+        entry_words = set(entry["task"].lower().split())
+        overlap = len(task_words & entry_words)
+        return (0, overlap, entry["timestamp"])
+
+    ranked = sorted(entries, key=score, reverse=True)
+
+    if query_embedding:
+        relevant = [
+            e for e in ranked
+            if e.get("embedding") and _cosine_similarity(query_embedding, e["embedding"]) > 0.55
+        ]
+        if relevant:
+            return relevant[:top_k]
+
+    relevant = [e for e in ranked if len(task_words & set(e["task"].lower().split())) > 0]
+    return relevant[:top_k]
+
+
+def format_for_prompt(entries):
+    if not entries:
+        return ""
+    lines = ["Relevant memory from past sessions in this project:"]
+    for e in entries:
+        lines.append(f"- Task: \"{e['task']}\" -> {e['summary']}")
+    return "\n".join(lines)
+```
+
+---
+
+## custom_tool_registry.py — Self-Created Tools
+
+Lets the agent write, validate, save, and hot-reload its own new tools at runtime.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **AST validation** | Syntax-checked before anything touches disk |
+| **Callable check** | Executed in an isolated namespace to confirm the function exists |
+| **Import allowlist** | Only pure stdlib allowed — no `os`, `subprocess`, `socket` etc. |
+| **Atomic schema save** | `custom_tools_schema.json` via temp file + `os.replace()` |
+| **Overwrite support** | Re-creating a tool with the same name replaces the old one |
+| **Persistent** | Survives process restarts — loaded automatically on next startup |
+| **Hot-reload** | `_refresh_custom_tools()` makes the new tool usable on the very next turn |
+| **Isolated load errors** | A broken tool skips gracefully; others still load |
+
+### Allowed Imports
+
+```
+re  json  math  time  datetime  collections  itertools  functools
+string  textwrap  difflib  random  statistics  typing  dataclasses
+enum  decimal  fractions
+```
+
+### Full Code
+
+```python
+"""
+custom_tool_registry.py — lets the agent create its OWN new tools.
+"""
+
+import ast
+import importlib
+import json
+import os
+import re
+
+CUSTOM_TOOLS_FILE = "custom_tools.py"
+CUSTOM_SCHEMA_FILE = "custom_tools_schema.json"
+
+_VALID_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+_ALLOWED_IMPORTS = {
+    "re", "json", "math", "time", "datetime", "collections", "itertools",
+    "functools", "string", "textwrap", "difflib", "random", "statistics",
+    "typing", "dataclasses", "enum", "decimal", "fractions",
+}
+
+
+def _check_import_safety(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root not in _ALLOWED_IMPORTS:
+                    return (f"Import of '{alias.name}' is not allowed in a self-created tool "
+                            f"(allowed: {', '.join(sorted(_ALLOWED_IMPORTS))}).")
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root not in _ALLOWED_IMPORTS:
+                return f"Import from '{node.module}' is not allowed."
+    return None
+
+
+def _ensure_files():
+    if not os.path.exists(CUSTOM_TOOLS_FILE):
+        with open(CUSTOM_TOOLS_FILE, "w") as f:
+            f.write('"""custom_tools.py — tools the agent has created for itself over time."""\n\n')
+    if not os.path.exists(CUSTOM_SCHEMA_FILE):
+        with open(CUSTOM_SCHEMA_FILE, "w") as f:
+            json.dump([], f)
+
+
+def _load_schema():
+    _ensure_files()
+    with open(CUSTOM_SCHEMA_FILE, "r") as f:
+        return json.load(f)
+
+
+def _save_schema(schema_list):
+    tmp = CUSTOM_SCHEMA_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(schema_list, f, indent=2)
+    os.replace(tmp, CUSTOM_SCHEMA_FILE)
+
+
+def _validate_code_defines_callable(name, code):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, f"Code has a syntax error: {e}"
+
+    defines_target = any(
+        isinstance(node, ast.FunctionDef) and node.name == name
+        for node in ast.walk(tree)
+    )
+    if not defines_target:
+        return False, f"Code does not define a function named '{name}'."
+
+    import_error = _check_import_safety(tree)
+    if import_error:
+        return False, import_error
+
+    namespace = {}
+    try:
+        exec(compile(tree, "<custom_tool>", "exec"), namespace)
+    except Exception as e:
+        return False, f"Code raised an error when defining it: {e}"
+
+    if name not in namespace or not callable(namespace[name]):
+        return False, f"After execution, '{name}' is not a callable in the namespace."
+
+    return True, None
+
+
+def create_tool(name, description, parameters_json, code):
+    """Validate and permanently save a new agent-created tool."""
+    if not _VALID_NAME.match(name):
+        return f"ERROR: '{name}' is not a valid tool name (use lowercase snake_case)."
+
+    try:
+        parameters = json.loads(parameters_json)
+    except json.JSONDecodeError as e:
+        return f"ERROR: parameters_json is not valid JSON: {e}"
+
+    ok, err = _validate_code_defines_callable(name, code)
+    if not ok:
+        return f"ERROR: tool not saved — {err}"
+
+    _ensure_files()
+    schema_list = _load_schema()
+    schema_list = [s for s in schema_list if s["function"]["name"] != name]
+    schema_list.append({
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": parameters},
+    })
+    _save_schema(schema_list)
+
+    with open(CUSTOM_TOOLS_FILE, "a") as f:
+        f.write(f"\n\n# --- {name} ---\n{code}\n")
+
+    return f"Tool '{name}' created and saved permanently. Available immediately and in all future sessions."
+
+
+def load_custom_tools():
+    """Load all previously created tools. Returns (schema_list, functions_dict, errors_list)."""
+    _ensure_files()
+    schema_list = _load_schema()
+    functions = {}
+    errors = []
+
+    try:
+        if "custom_tools" in importlib.sys.modules:
+            module = importlib.reload(importlib.sys.modules["custom_tools"])
+        else:
+            module = importlib.import_module("custom_tools")
+    except Exception as e:
+        return [], {}, [f"Could not load custom_tools.py at all: {e}"]
+
+    valid_schema = []
+    for entry in schema_list:
+        fn_name = entry["function"]["name"]
+        fn = getattr(module, fn_name, None)
+        if fn is None or not callable(fn):
+            errors.append(f"Tool '{fn_name}' is in schema but missing/broken — skipped.")
+            continue
+        functions[fn_name] = fn
+        valid_schema.append(entry)
+
+    return valid_schema, functions, errors
+
+
+CREATE_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "create_tool",
+        "description": "Create and PERMANENTLY save a new tool/function when no existing tool "
+                        "covers what the current task needs. Available immediately and in all "
+                        "future sessions. Only use when genuinely no combination of existing "
+                        "tools can do the job.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "lowercase snake_case function name"},
+            "description": {"type": "string"},
+            "parameters_json": {"type": "string", "description": "OpenAI function-parameters schema as JSON string"},
+            "code": {"type": "string", "description": "full Python function definition matching name"},
+        }, "required": ["name", "description", "parameters_json", "code"]},
+    }},
+]
+CREATE_TOOL_FUNCTIONS = {"create_tool": create_tool}
+```
+
+---
+
+## custom_tools.py — Agent-Created Tools
+
+Auto-generated and appended to by `create_tool`. Do not edit manually.
+
+### Currently Saved Tools
+
+| Tool | What it does |
+|---|---|
+| `count_python_lines` | Returns the number of lines in a given `.py` file |
+
+### Full Code
+
+```python
+"""custom_tools.py — tools the agent has created for itself over time."""
+
+
+# --- count_python_lines ---
+def count_python_lines(file_path: str) -> str:
+    """Return the number of lines in the given Python file.
+    Returns a string with the count or an error message.
+    """
+    import os
+    if not os.path.exists(file_path):
+        return f"ERROR: {file_path} does not exist."
+    if not file_path.lower().endswith('.py'):
+        return f"ERROR: {file_path} is not a Python file."
+    try:
+        with open(file_path, 'r', errors='ignore') as f:
+            lines = f.readlines()
+        count = len(lines)
+        return f"{count}"
+    except Exception as e:
+        return f"ERROR: Could not read file: {e}"
+```
+
+---
+
+## firebase_tools.py — Firebase Scaffolding
+
+Generates a complete set of Firebase starter files (config, auth, Firestore helpers, security rules) for any web app.
+
+### Generated Files
+
+| File | Contents |
+|---|---|
+| `firebase-config.js` | App init + placeholder config values to fill in |
+| `auth.js` | `signUp`, `logIn`, `logOut`, `watchAuthState` |
+| `db.js` | `createDoc`, `getDocById`, `getAllDocs`, `getDocsWhereOwner`, `updateDocById`, `deleteDocById` |
+| `firestore.rules` | Auth-required reads; owner-only writes/updates/deletes |
+
+### Full Code
+
+```python
+"""
+firebase_tools.py — generates Firebase-backed app boilerplate.
+"""
+
+from tools import write_file
+
+
+FIREBASE_CONFIG_TEMPLATE = """// firebase-config.js
+// Paste your project's config here — get it from:
+// Firebase Console > Project Settings > General > Your apps > SDK setup and config
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+
+const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+export const db = getFirestore(app);
+"""
+
+AUTH_TEMPLATE = """// auth.js — email/password signup, login, logout
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { auth } from "./firebase-config.js";
+
+export async function signUp(email, password) {
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    return { success: true, user: cred.user };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function logIn(email, password) {
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email, password);
+    return { success: true, user: cred.user };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function logOut() {
+  await signOut(auth);
+}
+
+export function watchAuthState(onLoggedIn, onLoggedOut) {
+  onAuthStateChanged(auth, (user) => {
+    if (user) onLoggedIn(user);
+    else onLoggedOut();
+  });
+}
+"""
+
+FIRESTORE_HELPERS_TEMPLATE = """// db.js — read/write helpers for collection: {collection_name}
+import {{
+  collection, doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, query, where
+}} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import {{ db }} from "./firebase-config.js";
+
+const COLLECTION = "{collection_name}";
+
+export async function createDoc(id, data) {{
+  await setDoc(doc(db, COLLECTION, id), data);
+}}
+
+export async function getDocById(id) {{
+  const snap = await getDoc(doc(db, COLLECTION, id));
+  return snap.exists() ? snap.data() : null;
+}}
+
+export async function getAllDocs() {{
+  const snap = await getDocs(collection(db, COLLECTION));
+  return snap.docs.map(d => ({{ id: d.id, ...d.data() }}));
+}}
+
+export async function getDocsWhereOwner(userId, ownerField="ownerId") {{
+  const q = query(collection(db, COLLECTION), where(ownerField, "==", userId));
+  const snap = await getDocs(q);
+  return snap.docs.map(d => ({{ id: d.id, ...d.data() }}));
+}}
+
+export async function updateDocById(id, data) {{
+  await updateDoc(doc(db, COLLECTION, id), data);
+}}
+
+export async function deleteDocById(id) {{
+  await deleteDoc(doc(db, COLLECTION, id));
+}}
+"""
+
+FIRESTORE_RULES_TEMPLATE = """rules_version = '2';
+service cloud.firestore {{
+  match /databases/{{database}}/documents {{
+    match /{collection_name}/{{docId}} {{
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+                    && request.resource.data.{owner_field} == request.auth.uid;
+      allow update, delete: if request.auth != null
+                    && resource.data.{owner_field} == request.auth.uid;
+    }}
+  }}
+}}
+"""
+
+
+def scaffold_firebase_app(collection_name="items", owner_field="ownerId", output_dir="."):
+    """
+    Generates firebase-config.js, auth.js, db.js, and firestore.rules.
+    Returns a summary + the manual steps still needed in the Firebase console.
+    """
+    files_written = []
+
+    for filename, content in [
+        ("firebase-config.js", FIREBASE_CONFIG_TEMPLATE),
+        ("auth.js", AUTH_TEMPLATE),
+        ("db.js", FIRESTORE_HELPERS_TEMPLATE.format(collection_name=collection_name)),
+        ("firestore.rules", FIRESTORE_RULES_TEMPLATE.format(
+            collection_name=collection_name, owner_field=owner_field)),
+    ]:
+        path = f"{output_dir}/{filename}".replace("//", "/")
+        write_file(path, content)
+        files_written.append(path)
+
+    return (
+        "Files generated:\n  " + "\n  ".join(files_written) + "\n\n"
+        "Manual steps still needed in the Firebase console (console.firebase.google.com):\n"
+        "  1. Create a project and add a Web app; copy config into firebase-config.js.\n"
+        "  2. Build > Authentication > Sign-in method > enable Email/Password.\n"
+        "  3. Build > Firestore Database > Create database.\n"
+        "  4. Firestore > Rules tab > paste firestore.rules, click Publish."
+    )
+
+
+FIREBASE_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "scaffold_firebase_app",
+        "description": "Generate Firebase auth + Firestore boilerplate files for a web app "
+                        "that needs user login and per-user private data.",
+        "parameters": {"type": "object", "properties": {
+            "collection_name": {"type": "string", "default": "items"},
+            "owner_field": {"type": "string", "default": "ownerId"},
+            "output_dir": {"type": "string", "default": "."},
+        }},
+    }},
+]
+FIREBASE_TOOL_FUNCTIONS = {"scaffold_firebase_app": scaffold_firebase_app}
+```
+
+---
+
+## github_tools.py — GitHub Integration
+
+Real GitHub operations via REST API. No CLI dependency — uses `requests` directly.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Auto repo detection** | Parses `owner/repo` from HTTPS and SSH remote URL formats |
+| **`git_push`** | Push current or named branch to origin |
+| **`create_branch`** | Create and checkout a new branch off an up-to-date base |
+| **`open_pull_request`** | Open a real PR and return its URL |
+| **`list_open_issues`** | Fetch open issues for pre-work context |
+
+### Full Code
+
+```python
+"""
+github_tools.py — real GitHub integration: push, branch, open PRs.
+"""
+
+import os
+import re
+import requests
+from tools import run_bash
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_API = "https://api.github.com"
+
+
+def _get_repo_slug():
+    """Parse 'owner/repo' from git remote get-url origin (HTTPS or SSH)."""
+    result = run_bash("git remote get-url origin", confirmed=True)
+    if "exit code 0" not in result:
+        return None, f"Could not read git remote: {result}"
+    url_line = result.split("\n", 1)[1].strip() if "\n" in result else ""
+    match = re.search(r"github\.com[:/]([^/]+)/([^/.\s]+)", url_line)
+    if not match:
+        return None, f"Could not parse a GitHub owner/repo from remote URL: {url_line}"
+    return f"{match.group(1)}/{match.group(2)}", None
+
+
+def _headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def git_push(branch=None, set_upstream=True):
+    if not branch:
+        result = run_bash("git rev-parse --abbrev-ref HEAD", confirmed=True)
+        if "exit code 0" not in result:
+            return f"Could not determine current branch: {result}"
+        branch = result.split("\n", 1)[1].strip()
+    cmd = f"git push {'--set-upstream ' if set_upstream else ''}origin {branch}"
+    return run_bash(cmd, confirmed=True, timeout=60)
+
+
+def create_branch(branch_name, from_branch="main"):
+    return run_bash(
+        f"git checkout {from_branch} && git pull && git checkout -b {branch_name}",
+        confirmed=True
+    )
+
+
+def open_pull_request(title, body="", head=None, base="main"):
+    if not GITHUB_TOKEN:
+        return "ERROR: GITHUB_TOKEN not set. Add it as a Replit Secret first."
+    repo_slug, err = _get_repo_slug()
+    if err:
+        return f"ERROR: {err}"
+    if not head:
+        result = run_bash("git rev-parse --abbrev-ref HEAD", confirmed=True)
+        if "exit code 0" not in result:
+            return f"Could not determine current branch: {result}"
+        head = result.split("\n", 1)[1].strip()
+    try:
+        resp = requests.post(
+            f"{GITHUB_API}/repos/{repo_slug}/pulls",
+            headers=_headers(),
+            json={"title": title, "body": body, "head": head, "base": base},
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"ERROR: could not reach GitHub API: {e}"
+    if resp.status_code == 201:
+        data = resp.json()
+        return f"Pull request opened: {data['html_url']}"
+    return f"ERROR: GitHub API returned {resp.status_code}: {resp.text[:500]}"
+
+
+def list_open_issues(limit=10):
+    if not GITHUB_TOKEN:
+        return "ERROR: GITHUB_TOKEN not set."
+    repo_slug, err = _get_repo_slug()
+    if err:
+        return f"ERROR: {err}"
+    try:
+        resp = requests.get(
+            f"{GITHUB_API}/repos/{repo_slug}/issues",
+            headers=_headers(),
+            params={"state": "open", "per_page": limit},
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        return f"ERROR: could not reach GitHub API: {e}"
+    if resp.status_code != 200:
+        return f"ERROR: GitHub API returned {resp.status_code}: {resp.text[:500]}"
+    issues = resp.json()
+    if not issues:
+        return "No open issues."
+    return "\n".join(f"#{i['number']}: {i['title']}" for i in issues if "pull_request" not in i)
+
+
+GITHUB_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "git_push",
+        "description": "Push the current git branch to GitHub (origin).",
+        "parameters": {"type": "object", "properties": {
+            "branch": {"type": "string", "description": "Branch to push, defaults to current branch"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "create_branch",
+        "description": "Create and check out a new git branch, based off an up-to-date base branch.",
+        "parameters": {"type": "object", "properties": {
+            "branch_name": {"type": "string"},
+            "from_branch": {"type": "string", "default": "main"},
+        }, "required": ["branch_name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "open_pull_request",
+        "description": "Open a real pull request on GitHub. The branch must already be pushed.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "body": {"type": "string", "default": ""},
+            "head": {"type": "string", "description": "Source branch, defaults to current branch"},
+            "base": {"type": "string", "default": "main"},
+        }, "required": ["title"]},
+    }},
+    {"type": "function", "function": {
+        "name": "list_open_issues",
+        "description": "List open GitHub issues on this repo, for context before starting work.",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "default": 10},
+        }},
+    }},
+]
+
+GITHUB_TOOL_FUNCTIONS = {
+    "git_push": git_push,
+    "create_branch": create_branch,
+    "open_pull_request": open_pull_request,
+    "list_open_issues": list_open_issues,
+}
+```
+
+---
+
+## meta_builder.py — Simulation Generator
+
+Generates a complete, self-contained N-agent simulation system from a single theme prompt using parallel LLM batch calls.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Parallel generation** | Splits persona count into batches; runs all but the first in parallel |
+| **Name deduplication** | First batch runs solo; later batches told to avoid those names |
+| **Partial preservation** | Failed batches reported but successful ones still used |
+| **Markdown fence stripping** | Handles models that wrap JSON in code fences despite instructions |
+| **Full output** | Writes `agents.json`, `memory.py`, `tick_engine.py`, `viewer.py` |
+
+### Persona Fields per Agent
+
+`id`, `name`, `role`, `personality`, `backstory`, `routine` (time-range dict), `relationships` (name→description dict), `secret`
+
+### Full Code
+
+```python
+"""
+meta_builder.py — generates a complete N-agent simulation system from one theme prompt.
+"""
+
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from provider_pool import ask_ai
+
+BATCH_SIZE = 5
+MAX_TOKENS_PER_BATCH = 3000
+
+
+def _persona_prompt(theme, n, existing_names):
+    avoid = f" Do not reuse these names: {', '.join(existing_names)}." if existing_names else ""
+    return f"""Generate exactly {n} distinct characters for an agent-based simulation themed around: {theme}.
+
+Each character needs these fields: id (short lowercase snake_case), name, role, \
+personality (short comma-separated traits), backstory (1-2 sentences), \
+routine (a dict of time-range strings like "6-9" to short activity descriptions, \
+covering a full day), relationships (a dict of other character ids/names to a short \
+relationship description), secret (a private goal or hidden truth).{avoid}
+
+Respond with ONLY a JSON array of {n} objects, no markdown fences, no commentary."""
+
+
+def _extract_json_array(text):
+    """Strip markdown fences before parsing."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def _generate_batch(theme, n, existing_names):
+    prompt = _persona_prompt(theme, n, existing_names)
+    message = ask_ai([{"role": "user", "content": prompt}], max_tokens=MAX_TOKENS_PER_BATCH)
+    if isinstance(message, dict) and "error" in message:
+        return [], f"Batch failed: {message['error']}"
+    content = message.get("content") if isinstance(message, dict) else message.content
+    try:
+        agents = _extract_json_array(content)
+        if not isinstance(agents, list):
+            return [], f"Batch did not return a JSON array: {content[:200]}"
+        return agents, None
+    except (json.JSONDecodeError, TypeError) as e:
+        return [], f"Batch JSON parse failed ({e}): {content[:200]}"
+
+
+def generate_roster(theme, count=30, batch_size=BATCH_SIZE, max_workers=6):
+    """Generate count personas in parallel batches. Returns (agents_list, errors_list)."""
+    batches = []
+    remaining = count
+    while remaining > 0:
+        n = min(batch_size, remaining)
+        batches.append(n)
+        remaining -= n
+
+    all_agents = []
+    errors = []
+
+    first_agents, err = _generate_batch(theme, batches[0], [])
+    all_agents.extend(first_agents)
+    if err:
+        errors.append(err)
+
+    if len(batches) > 1:
+        existing_names = [a.get("name", "") for a in all_agents]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_generate_batch, theme, n, existing_names): n
+                for n in batches[1:]
+            }
+            for future in as_completed(futures):
+                agents, err = future.result()
+                all_agents.extend(agents)
+                if err:
+                    errors.append(err)
+
+    return all_agents, errors
+
+
+def build_agent_system(theme, count=30, output_dir="."):
+    """
+    Generate agents.json, memory.py, tick_engine.py, and viewer.py.
+    Returns a summary string.
+    """
+    agents, errors = generate_roster(theme, count)
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(os.path.join(output_dir, "agents.json"), "w") as f:
+        json.dump({"agents": agents}, f, indent=2)
+
+    # memory.py, tick_engine.py, viewer.py written from embedded templates
+    # (MEMORY_TEMPLATE, TICK_ENGINE_TEMPLATE, VIEWER_TEMPLATE in source)
+
+    summary = f"Generated {len(agents)}/{count} agents for theme: '{theme}'\n"
+    summary += "Run: python tick_engine.py  and  python viewer.py  in separate shells.\n"
+    if errors:
+        summary += f"\n{len(errors)} batch(es) had issues:\n" + "\n".join(f"  - {e}" for e in errors)
+    return summary
+```
+
+---
+
+## tick_engine.py — Simulation Runtime
+
+Drives the simulation hour by hour. For every agent each tick: build prompt → call LLM → log action → store memory.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **Hourly ticks** | Cycles hours 0–23 indefinitely, incrementing days |
+| **Routine-aware** | `routine_for_hour()` handles midnight-wrapping ranges (e.g. `"21-6"`) |
+| **Memory injection** | Top 5 relevant memories fetched per agent per tick |
+| **Personality + secrets** | Both woven into the prompt; secret influences quietly |
+| **Resilient LLM calls** | Single API failure skips the agent's turn; simulation keeps running |
+| **Configurable** | `LLM_BASE_URL` and `LLM_MODEL` env vars; works with any OpenAI-compatible endpoint |
+
+### Full Code
+
+```python
+"""
+tick_engine.py — the heart of the simulation. Each tick = one in-world hour.
+"""
+
+import json
+import os
+import time
+import requests
+from memory import AgentMemoryStore
+
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen/qwen3-coder")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+
+TICK_HOURS = list(range(24))
+EVENT_LOG_PATH = "event_log.json"
+AGENTS_PATH = "agents.json"
+
+
+def load_agents():
+    with open(AGENTS_PATH, "r") as f:
+        return json.load(f)["agents"]
+
+
+def routine_for_hour(agent, hour):
+    """Find which routine block covers the current hour (handles midnight-wrap ranges)."""
+    routine = agent.get("routine", {})
+    for time_range, activity in routine.items():
+        if time_range == "variable":
+            continue
+        if "-" in time_range:
+            start, end = time_range.split("-")
+            start, end = int(start), int(end)
+            if start < end:
+                if start <= hour < end:
+                    return activity
+            else:
+                if hour >= start or hour < end:
+                    return activity
+    return routine.get("variable", "No specific plan this hour.")
+
+
+def build_prompt(agent, hour, day, memories):
+    memory_text = "\n".join(f"- {m.text}" for m in memories) if memories else "No notable memories yet."
+    relationships = "\n".join(f"- {name}: {desc}" for name, desc in agent.get("relationships", {}).items())
+
+    return f"""You are {agent['name']}, {agent['role']} in a small Japanese town.
+
+Personality: {agent['personality']}
+Backstory: {agent.get('backstory', '')}
+Private goal/secret: {agent.get('secret', 'None')}
+
+Current time: Day {day}, Hour {hour}:00
+Your usual routine at this hour: {routine_for_hour(agent, hour)}
+
+Relationships:
+{relationships or 'No notable relationships defined.'}
+
+Relevant memories:
+{memory_text}
+
+What do you do or say right now? Respond in 1-3 sentences, third person,
+as a short story beat. Stay strictly in character."""
+
+
+def call_llm(prompt: str) -> str:
+    if not LLM_API_KEY:
+        return f"[NO API KEY SET] Would have prompted: {prompt[:60]}..."
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 200}
+    try:
+        resp = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except requests.exceptions.RequestException as e:
+        return f"[API ERROR — skipped this turn] {e}"
+    except (KeyError, IndexError, ValueError) as e:
+        return f"[MALFORMED RESPONSE — skipped this turn] {e}"
+
+
+def log_event(day, hour, agent_name, action_text):
+    entry = {"day": day, "hour": hour, "agent": agent_name, "text": action_text, "logged_at": time.time()}
+    log = []
+    if os.path.exists(EVENT_LOG_PATH):
+        with open(EVENT_LOG_PATH, "r") as f:
+            log = json.load(f)
+    log.append(entry)
+    with open(EVENT_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+    print(f"[Day {day} {hour:02d}:00] {agent_name}: {action_text}")
+
+
+def run_tick(day, hour, agents, stores):
+    global_tick = day * 24 + hour
+    for agent in agents:
+        store = stores[agent["id"]]
+        memories = store.retrieve_relevant(current_tick=global_tick, top_k=5)
+        prompt = build_prompt(agent, hour, day, memories)
+        action_text = call_llm(prompt)
+        log_event(day, hour, agent["name"], action_text)
+        store.add(text=action_text, tick=global_tick, importance=5)
+
+
+def main():
+    agents = load_agents()
+    stores = {a["id"]: AgentMemoryStore(a["id"]) for a in agents}
+    day = 0
+    while True:
+        for hour in TICK_HOURS:
+            run_tick(day, hour, agents, stores)
+            time.sleep(1)
+        day += 1
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## memory.py — Per-Agent Memory Store
+
+Lightweight JSON-backed memory for each simulation agent. Used by `tick_engine.py` and `director.py`.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **JSON persistence** | `.agent_memory_{id}.json` per agent — survives restarts |
+| **Importance-first** | Higher `importance` surfaces first; recency breaks ties |
+| **Future-entry guard** | Filters entries with tick > current_tick |
+| **Size limit** | Caps at 200 entries; oldest trimmed on save |
+| **Crash-safe** | Temp file + `os.replace()` |
+| **`MemoryItem` dataclass** | `.text`, `.tick`, `.importance` accessible as attributes |
+
+### Full Code
+
+```python
+"""
+memory.py — simple per-agent memory store used by the generated tick_engine.
+"""
+
+import json
+import os
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class MemoryItem:
+    text: str
+    tick: int
+    importance: int
+
+
+class AgentMemoryStore:
+    MAX_STORED = 200
+
+    def __init__(self, agent_id: str, memory_path: str | None = None):
+        self.agent_id = agent_id
+        self.path = memory_path or f".agent_memory_{agent_id}.json"
+        self._entries: List[dict] = self._load()
+
+    def _load(self) -> List[dict]:
+        if not os.path.exists(self.path):
+            return []
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except (json.JSONDecodeError, OSError):
+            pass
+        return []
+
+    def _save(self) -> None:
+        to_save = self._entries[-self.MAX_STORED:]
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, indent=2)
+        os.replace(tmp, self.path)
+
+    def add(self, text: str, tick: int, importance: int = 5) -> None:
+        """Append a new memory entry."""
+        self._entries.append({"text": text, "tick": tick, "importance": importance})
+        self._save()
+
+    def retrieve_relevant(self, current_tick: int, top_k: int = 5) -> List[MemoryItem]:
+        """Return top_k memories by importance desc, then recency desc."""
+        candidates = [e for e in self._entries if e.get("tick", 0) <= current_tick]
+        candidates.sort(key=lambda e: (e.get("importance", 0), e.get("tick", 0)), reverse=True)
+        selected = candidates[:top_k]
+        return [MemoryItem(text=e["text"], tick=e["tick"], importance=e.get("importance", 0))
+                for e in selected]
+```
+
+---
+
+## director.py — Event Injection
+
+Inject world or personal events into a running simulation. Every recipient gets a max-importance memory and reacts on their next tick.
+
+### Features
+
+| Feature | Description |
+|---|---|
+| **`inject_event`** | Broadcasts to ALL agents + logs in event feed with `"WORLD EVENT"` tag |
+| **`inject_event_for_agent`** | Targeted delivery to a single agent by `agent_id` |
+| **Max importance** | Events stored at `importance=10` — always surfaces on the next tick |
+| **Auto tick inference** | Reads current simulation time from `event_log.json` |
+| **Viewer integration** | World events appear distinctly styled in the live feed |
+
+### Usage
+
+```python
+from director import inject_event, inject_event_for_agent
+
+# Broadcast to all agents
+inject_event("A mass casualty event just arrived — a bus crash with 12 injured.")
+
+# Targeted personal event
+inject_event_for_agent("nurse_keiko", "You just received a call from your daughter.")
+```
+
+### Full Code
+
+```python
+"""
+director.py — inject events into a running simulation.
+"""
+
+import json
+import os
+import time
+from memory import AgentMemoryStore
+
+AGENTS_PATH = "agents.json"
+EVENT_LOG_PATH = "event_log.json"
+EVENT_IMPORTANCE = 10
+
+
+def _load_agents():
+    with open(AGENTS_PATH, "r") as f:
+        return json.load(f)["agents"]
+
+
+def _current_tick():
+    """Infer current tick from the last entry in event_log.json."""
+    if not os.path.exists(EVENT_LOG_PATH):
+        return 0
+    with open(EVENT_LOG_PATH, "r") as f:
+        log = json.load(f)
+    if not log:
+        return 0
+    last = log[-1]
+    return last.get("day", 0) * 24 + last.get("hour", 0)
+
+
+def inject_event(event_text, tick=None):
+    """
+    Broadcast a world event to all agents.
+    Logged to event_log.json (shows in viewer.py with WORLD EVENT tag).
+    Added as importance=10 memory to every agent.
+    """
+    agents = _load_agents()
+    current_tick = tick if tick is not None else _current_tick()
+
+    for agent in agents:
+        store = AgentMemoryStore(agent["id"])
+        store.add(text=f"[WORLD EVENT] {event_text}", tick=current_tick, importance=EVENT_IMPORTANCE)
+
+    log = []
+    if os.path.exists(EVENT_LOG_PATH):
+        with open(EVENT_LOG_PATH, "r") as f:
+            log = json.load(f)
+    day, hour = divmod(current_tick, 24)
+    log.append({
+        "day": day, "hour": hour, "agent": "WORLD EVENT",
+        "text": event_text, "logged_at": time.time(),
+    })
+    with open(EVENT_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+
+    return f"Event injected at Day {day} {hour:02d}:00, delivered to {len(agents)} agents."
+
+
+def inject_event_for_agent(agent_id, event_text, tick=None):
+    """Deliver a personal event to a single agent."""
+    agents = _load_agents()
+    if not any(a["id"] == agent_id for a in agents):
+        return f"ERROR: no agent with id '{agent_id}' found in {AGENTS_PATH}."
+    current_tick = tick if tick is not None else _current_tick()
+    store = AgentMemoryStore(agent_id)
+    store.add(text=f"[PERSONAL EVENT] {event_text}", tick=current_tick, importance=EVENT_IMPORTANCE)
+    return f"Personal event delivered to '{agent_id}' at tick {current_tick}."
+```
+
+---
+
+## Utility Files
+
+These are small helper files written by the agent as examples or during task execution.
+
+### calc.py
+
+Safe division function with full input validation and division-by-zero guard.
+
+```python
+# calc.py — safe division function
+
+def divide(a, b):
+    if not isinstance(a, (int, float)):
+        raise TypeError(f"Argument 'a' must be a number, got {type(a).__name__}")
+    if not isinstance(b, (int, float)):
+        raise TypeError(f"Argument 'b' must be a number, got {type(b).__name__}")
+    if b == 0:
+        return None
+    return a / b
+
+print(divide(10, 0))
+```
+
+### greeter.py
+
+Simple greeting utility module.
+
+```python
+# greeter.py — utility module for greeting users
+
+def greet(name: str) -> str:
+    """Return a greeting string for the given name.
+
+    Args:
+        name: The name of the person to greet.
+
+    Returns:
+        A greeting message in the format "Hello, <name>".
+    """
+    return "Hello, " + name
+```
+
+### mathutils.py
+
+Integer squaring helper.
+
+```python
+# mathutils.py
+
+def square(x: int) -> int:
+    """Calculate the square of an integer.
+
+    Args:
+        x (int): The integer to be squared.
+
+    Returns:
+        int: The squared value (x * x).
+    """
+    return x * x
+```
+
+### shapes.py
+
+Circle and Square classes with area calculation.
+
+```python
+# shapes.py
+
+import math
+
+class Circle:
+    """Simple Circle shape with area calculation."""
+
+    def __init__(self, radius: float):
+        if radius < 0:
+            raise ValueError("Radius cannot be negative")
+        self.radius = radius
+
+    def area(self) -> float:
+        """Calculate the area of the circle (π * r²)."""
+        return math.pi * (self.radius ** 2)
+
+
+class Square:
+    """Simple Square shape with area calculation."""
+
+    def __init__(self, side: float):
+        if side < 0:
+            raise ValueError("Side length cannot be negative")
+        self.side = side
+
+    def area(self) -> float:
+        """Calculate the area of the square (side²)."""
+        return self.side ** 2
+```
+
+### test_calc.py
+
+Unit tests for `calc.py` using `unittest`.
+
+```python
+# test_calc.py
+
+import unittest
+import calc
+
+class TestCalc(unittest.TestCase):
+    def test_divide_normal(self):
+        self.assertEqual(calc.divide(10, 2), 5)
+        self.assertEqual(calc.divide(-4, 2), -2)
+        self.assertEqual(calc.divide(5.0, 2), 2.5)
+
+    def test_divide_by_zero(self):
+        self.assertIsNone(calc.divide(10, 0))
+
+    def test_divide_invalid_type(self):
+        with self.assertRaises(TypeError):
+            calc.divide('10', 2)
+        with self.assertRaises(TypeError):
+            calc.divide(10, '2')
+        with self.assertRaises(TypeError):
+            calc.divide('10', '2')
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+---
+
+## Environment Variables
+
+| Variable | Required | Used By | Description |
+|---|---|---|---|
+| `CEREBRAS_API_KEY` | Recommended | `provider_pool.py` | Primary (fastest) LLM provider |
+| `CEREBRAS_API_KEY_2` … `_N` | Optional | `provider_pool.py` | Additional Cerebras keys for rotation |
+| `OPENROUTER_API_KEY` | Optional | `provider_pool.py` | Secondary LLM provider |
+| `OPENROUTER_API_KEY_2` … `_3` | Optional | `provider_pool.py` | Additional OpenRouter keys |
+| `GROQ_API_KEY` | Optional | `provider_pool.py` | Fallback LLM provider |
+| `GEMINI_API_KEY` | Optional | `task_memory.py` | Enables semantic (embedding-based) memory recall |
+| `GITHUB_TOKEN` | Optional | `github_tools.py` | Required for PR creation and issue listing |
+| `LLM_API_KEY` | Optional | `tick_engine.py` | API key for the simulation tick engine |
+| `LLM_BASE_URL` | Optional | `tick_engine.py` | Override tick engine endpoint (default: OpenRouter) |
+| `LLM_MODEL` | Optional | `tick_engine.py` | Override tick engine model (default: `qwen/qwen3-coder`) |
+| `CEREBRAS_MODEL` | Optional | `provider_pool.py` | Override default Cerebras model |
+| `GROQ_MODEL` | Optional | `provider_pool.py` | Override default Groq model |
+| `OPENROUTER_MODEL` | Optional | `provider_pool.py` | Override default OpenRouter model |
+
+At least one of `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, or `GROQ_API_KEY` must be set.
+
+---
+
+## Full System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        cli.py                               │
+│  ┌─────────────────┐        ┌──────────────────────────┐   │
+│  │  One-shot mode  │        │    Interactive mode       │   │
+│  │  run_agent()    │        │    Conversation.send()    │   │
+│  └────────┬────────┘        └────────────┬─────────────┘   │
+└───────────┼─────────────────────────────┼────────────────── ┘
+            └──────────────┬──────────────┘
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      agent.py                                │
+│                                                              │
+│   task_memory.retrieve_relevant() → inject into system prompt│
+│                                                              │
+│   ┌──────────────────────────────────────────────────────┐  │
+│   │                   _run_loop()                        │  │
+│   │                                                      │  │
+│   │   ask_ai(messages, tools=TOOL_SCHEMA)                │  │
+│   │        │                                             │  │
+│   │        ▼                                             │  │
+│   │   ┌────────────────────────────────────┐            │  │
+│   │   │         provider_pool.py           │            │  │
+│   │   │  Cerebras → OpenRouter → Groq      │            │  │
+│   │   │  Multi-key rotation + cooldowns    │            │  │
+│   │   └────────────────┬───────────────────┘            │  │
+│   │                    │ tool_calls                      │  │
+│   │                    ▼                                 │  │
+│   │   _execute_tool_call()                               │  │
+│   │        │                                             │  │
+│   │        ▼                                             │  │
+│   │   ┌───────────────────────────────────────────────┐ │  │
+│   │   │              Tool Registry                    │ │  │
+│   │   │  tools.py       read/write/edit/bash/git      │ │  │
+│   │   │  firebase_tools scaffold_firebase_app         │ │  │
+│   │   │  github_tools   push/branch/PR/issues         │ │  │
+│   │   │  meta_builder   build_agent_system            │ │  │
+│   │   │  create_tool    write new tools permanently   │ │  │
+│   │   │  custom_tools   agent-created tools           │ │  │
+│   │   └───────────────────────────────────────────────┘ │  │
+│   │                    │ result → messages               │  │
+│   │                    └──────────── repeat ─────────────┘  │
+│   │                                                      │  │
+│   │   (until plain-text reply or MAX_TURNS = 40)         │  │
+│   └──────────────────────────────────────────────────────┘  │
+│                                                              │
+│   task_memory.add_task_summary()  →  .agent_memory.json      │
+└──────────────────────────────────────────────────────────────┘
+
+Fan-out (parallel tasks):
+  fan_out("Review {target} for bugs.", ["auth.py", "db.py", "api.py"])
+    └─ ThreadPoolExecutor (≤8 workers)
+         └─ run_agent() per target (use_memory=False)
+         └─ {target: result} merged and returned
+
+─────────────────────────────────────────────────────────────────
+
+Simulation subsystem (runs independently):
+
+  meta_builder.py
+    └─ generate_roster() — parallel batch LLM calls
+    └─ writes: agents.json, memory.py, tick_engine.py, viewer.py
+
+  tick_engine.py  (python tick_engine.py)
+    └─ for each hour of each day:
+         for each agent:
+           memory.retrieve_relevant()
+           build_prompt()
+           call_llm()
+           log_event() → event_log.json
+           memory.add()
+
+  director.py  (python -c "from director import inject_event; ...")
+    └─ inject_event(text)         → all agents get importance=10 memory
+    └─ inject_event_for_agent()   → single agent gets importance=10 memory
+
+  viewer.py  (python viewer.py)
+    └─ Flask server on :8080
+    └─ reads event_log.json, auto-refreshes every 5s
+```
