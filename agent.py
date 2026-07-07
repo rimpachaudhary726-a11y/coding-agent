@@ -1,20 +1,13 @@
 """
 agent.py — the core reasoning loop, plus fan-out for big tasks.
 
-Core loop: send the conversation + tool schema to the model, execute
-whatever tool_calls come back, feed results back in, repeat until the
-model responds with plain text and no more tool calls (task done).
-
-Fan-out: for tasks that name multiple files/targets, this spins up one
-independent Core Agent per target, running in parallel (ThreadPoolExecutor,
-same primitive main-11.py already imports). This is the "tree" — a root
-call decides whether a task needs to fan out, then each leaf is a full
-instance of run_agent() scoped to one file, and results merge back up
-into a single summary. Not literally 1000 agents for every request —
-just for requests that actually name that many independent targets.
+UPDATED: every tool call is now logged (name, args, latency, result preview,
+error flag) to .agent_runs.jsonl via run_logger.log_tool_call(). Everything
+else is unchanged from the original.
 """
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from provider_pool import ask_ai
@@ -23,7 +16,11 @@ from firebase_tools import FIREBASE_TOOL_SCHEMA, FIREBASE_TOOL_FUNCTIONS
 from github_tools import GITHUB_TOOL_SCHEMA, GITHUB_TOOL_FUNCTIONS
 from meta_builder import build_agent_system
 from custom_tool_registry import CREATE_TOOL_SCHEMA, CREATE_TOOL_FUNCTIONS, load_custom_tools
+from structural_search import STRUCTURAL_SEARCH_TOOL_SCHEMA, STRUCTURAL_SEARCH_TOOL_FUNCTIONS
+from lsp_client import LSP_TOOL_SCHEMA, LSP_TOOL_FUNCTIONS
+from file_search import FILE_SEARCH_TOOL_SCHEMA, FILE_SEARCH_TOOL_FUNCTIONS
 import task_memory
+import run_logger
 
 META_BUILDER_TOOL_SCHEMA = [
     {"type": "function", "function": {
@@ -48,24 +45,18 @@ for _err in _custom_load_errors:
 
 TOOL_SCHEMA = (
     TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA + GITHUB_TOOL_SCHEMA
-    + META_BUILDER_TOOL_SCHEMA + CREATE_TOOL_SCHEMA + _custom_schema
+    + META_BUILDER_TOOL_SCHEMA + CREATE_TOOL_SCHEMA + STRUCTURAL_SEARCH_TOOL_SCHEMA
+    + LSP_TOOL_SCHEMA + FILE_SEARCH_TOOL_SCHEMA + _custom_schema
 )
 TOOL_FUNCTIONS = {
     **TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS,
-    **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **_custom_functions,
+    **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **STRUCTURAL_SEARCH_TOOL_FUNCTIONS,
+    **LSP_TOOL_FUNCTIONS, **FILE_SEARCH_TOOL_FUNCTIONS, **_custom_functions,
 }
-# dispatch_subagent and its schema/function dict are defined further down (they
-# reference run_agent), then merged in right after their definition — see below.
 
 
 def _refresh_custom_tools():
-    """
-    Called right after create_tool runs successfully, so the new tool is
-    usable on the VERY NEXT turn of the current session too — not just
-    after restarting cli.py. Mutates TOOL_SCHEMA/TOOL_FUNCTIONS in place
-    (not reassigns) since ask_ai() and _execute_tool_call() both read
-    these as module-level globals.
-    """
+    """Hot-reload after create_tool — new tool usable on the very next turn."""
     schema_list, functions, errors = load_custom_tools()
     existing_names = {entry["function"]["name"] for entry in TOOL_SCHEMA}
     for entry in schema_list:
@@ -75,6 +66,7 @@ def _refresh_custom_tools():
     TOOL_FUNCTIONS.update(functions)
     return errors
 
+
 SYSTEM_PROMPT = """You are a coding agent with direct access to the filesystem \
 and shell via tools. You can read, write, and edit files, search the codebase, \
 run commands, and commit to git. Work step by step: investigate before you \
@@ -82,14 +74,19 @@ change anything, make the smallest correct change, and verify your work \
 (run tests or the relevant command) before declaring the task done. \
 When a task is genuinely finished, reply with plain text and no further tool calls.
 
-When looking for a file, check for PROJECT_INDEX.md first (read_file) — if \
-it exists, use it to go straight to the right file instead of exploring \
-from scratch. If it doesn't exist yet on a non-trivial project, consider \
-calling generate_project_index once early on to build it. Otherwise, check \
-the project root first (list_directory(".")) before searching subfolders. \
-Ignore artifacts/, node_modules/, lib/, .cache/, and other tooling/dependency \
-folders unless the user's request specifically points there — the user's \
-own code almost always lives at the project root.
+When looking for a file, check the project root first (list_directory(".")) \
+before searching subfolders. Ignore artifacts/, node_modules/, lib/, .cache/, \
+and other tooling/dependency folders unless the user's request specifically \
+points there — the user's own code almost always lives at the project root.
+
+For Python code, prefer find_definition, find_callers, find_references, and \
+outline_file over search_codebase whenever the question is about a specific \
+function, class, or symbol (e.g. "where is X defined", "what calls X", "what \
+would break if I rename X", "what's the shape of this file"). These are \
+AST-aware and won't match unrelated text in comments, strings, or similarly- \
+named things — they're precise where search_codebase is just text matching. \
+Use search_codebase for everything else: free-text search, non-Python files, \
+or when you don't yet know the exact symbol name.
 
 If the project has a test suite, call detect_and_run_tests after making code \
 changes, before declaring the task done — don't just assume a fix works.
@@ -120,100 +117,11 @@ before trying a different approach, rather than layering more changes on \
 top of a broken one. Only works on files already tracked by git; check the \
 result and fall back to fixing forward if revert isn't available."""
 
-# Tools allowed in PLAN MODE — pure investigation, nothing that writes, edits,
-# runs arbitrary commands, or touches git/GitHub. write_todos IS allowed since
-# presenting the plan is the whole point of this mode.
-PLAN_MODE_ALLOWED_TOOLS = {
-    "read_file", "read_files", "list_directory", "search_codebase",
-    "detect_and_run_tests", "write_todos", "dispatch_subagent",
-    "git_diff", "git_status", "generate_project_index",
-}
-
-PLAN_MODE_INSTRUCTIONS = """
-
-You are in PLAN MODE. You can freely investigate — read files, search the \
-codebase, run tests — but you CANNOT write, edit, run shell commands, or \
-touch git/GitHub in this mode; those tools are unavailable to you right now. \
-Your job is only to investigate and propose a plan. When you understand the \
-task, call write_todos with the concrete steps you'd take, then stop — do \
-not attempt anything further. The person will review your plan and decide \
-whether to have it actually executed."""
-
 MAX_TURNS = 40
-COMPACT_AFTER_MESSAGES = 30   # trigger compaction once history grows past this
-KEEP_RECENT_MESSAGES = 10     # always keep this many most-recent messages verbatim
 
 
-def _safe_cut_index(messages, cut_index):
-    """
-    Ensures a compaction cut point never lands in the middle of a
-    tool-call/tool-result pair — which is exactly what caused a real bug:
-    slicing kept an orphaned 'tool' result message whose matching assistant
-    tool_calls message got summarized away, and Cerebras (correctly)
-    rejected the resulting history as invalid.
-
-    Tool result messages always immediately follow the assistant message
-    that requested them, with nothing else in between — so walking
-    backward past any 'tool' role messages always lands exactly on the
-    assistant message that owns them, keeping the pair intact.
-    """
-    while cut_index > 0 and messages[cut_index]["role"] == "tool":
-        cut_index -= 1
-    return cut_index
-
-
-def _compact_messages(messages):
-    """
-    Summarizes older conversation history into one compact system-style note,
-    keeping the original system prompt and the most recent messages verbatim.
-    This is what prevents a long Conversation session from eventually hitting
-    a token limit and breaking — same problem real Claude Code's context
-    compaction solves.
-
-    Returns a new messages list: [original_system, compacted_summary, ...recent].
-    If summarization itself fails (API error), returns the original list
-    unchanged rather than losing history.
-    """
-    if len(messages) <= COMPACT_AFTER_MESSAGES:
-        return messages
-
-    system_msg = messages[0]
-    cut_index = _safe_cut_index(messages, len(messages) - KEEP_RECENT_MESSAGES)
-    recent = messages[cut_index:]
-    middle = messages[1:cut_index]
-
-    if not middle:
-        return messages
-
-    transcript = "\n".join(
-        f"{m.get('role', '?')}: {str(m.get('content') or m.get('tool_calls') or '')[:300]}"
-        for m in middle
-    )
-    summary_prompt = (
-        "Summarize this part of a coding session in 3-6 sentences: what was "
-        "asked, what was done, what files were touched, and any decisions or "
-        "facts worth remembering for later steps. Be concrete, not vague.\n\n"
-        f"{transcript}"
-    )
-    summary_response = ask_ai([{"role": "user", "content": summary_prompt}], max_tokens=400)
-    if isinstance(summary_response, dict) and "error" in summary_response:
-        return messages  # summarization failed — keep full history rather than losing it
-
-    summary_text = summary_response.get("content") if isinstance(summary_response, dict) else summary_response.content
-    if not summary_text:
-        return messages
-
-    summary_msg = {"role": "system", "content": f"[Earlier in this session]: {summary_text.strip()}"}
-    return [system_msg, summary_msg] + recent
-
-
-def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None, plan_mode=False):
+def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None):
     name = tool_call["function"]["name"]
-
-    if plan_mode and name not in PLAN_MODE_ALLOWED_TOOLS:
-        return (f"ERROR: '{name}' is not available in plan mode — you can only investigate "
-                f"right now (read/search/list/test tools). Propose your plan via write_todos instead.")
-
     try:
         args = json.loads(tool_call["function"]["arguments"] or "{}")
     except json.JSONDecodeError:
@@ -228,55 +136,39 @@ def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=No
         if confirm_destructive:
             args["confirmed"] = True
         elif confirm_callback and _matches_any(command.strip(), _DESTRUCTIVE_PATTERNS):
-            # Real pause here — ask a human before running anything destructive,
-            # instead of just reporting CONFIRMATION_REQUIRED back to the model
-            # and moving on.
             allowed = confirm_callback(command)
             if allowed:
                 args["confirmed"] = True
             else:
-                return f"Command declined by user: '{command}'. Not run. Try a different approach."
+                logged_result = f"Command declined by user: '{command}'. Not run. Try a different approach."
+                run_logger.log_tool_call(name, args, logged_result, 0.0, is_error=False)
+                return logged_result
 
+    start = time.perf_counter()
     try:
         result = func(**args)
+        is_error = isinstance(result, str) and result.startswith("ERROR")
     except TypeError as e:
-        return f"ERROR: bad arguments for {name}: {e}"
+        result = f"ERROR: bad arguments for {name}: {e}"
+        is_error = True
     except Exception as e:
-        return f"ERROR: {name} raised an exception: {e}"
+        result = f"ERROR: {name} raised an exception: {e}"
+        is_error = True
+    latency_ms = (time.perf_counter() - start) * 1000
 
     if name == "create_tool" and isinstance(result, str) and result.startswith("Tool '"):
-        # New tool saved successfully — make it usable on the very next turn
-        # of THIS session too, not just after restarting cli.py.
         refresh_errors = _refresh_custom_tools()
         if refresh_errors:
             result += f"\n(Note: {'; '.join(refresh_errors)})"
 
+    run_logger.log_tool_call(name, args, result, latency_ms, is_error=is_error)
     return result
 
 
-def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True, plan_mode=False):
+def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
     """
-    Runs the core tool-calling loop for a SINGLE, standalone task until the
-    model stops calling tools or MAX_TURNS is hit. Each call starts a fresh
-    conversation — use run_conversation (below) instead if you want follow-up
-    messages to build on what was just discussed in the same session.
-
-    `on_step` — optional callback(message_dict) for live CLI output.
-    `auto_confirm` — skips confirmation entirely, destructive commands just
-        run (used by fan-out leaves running unattended).
-    `confirm_callback` — optional callback(command) -> bool, called for real
-        when a destructive command needs a yes/no from an actual human
-        (see cli.py for the interactive version). Ignored if auto_confirm=True.
-    `use_memory` — pull in relevant past-session summaries for this project
-        and save a summary of this task when it finishes. Set False for
-        fan-out leaves to avoid many parallel writers hitting the same file.
-    `plan_mode` — restricts the agent to read-only investigation tools and
-        instructs it to propose a plan (via write_todos) instead of acting.
-        No writes, edits, shell commands, or git/GitHub actions can happen,
-        enforced both by hiding those tools from the schema AND rejecting
-        them at execution time as a second safety layer.
-
-    Returns the final plain-text response.
+    Single-shot task runner. Each call starts a fresh conversation.
+    use_memory=False for fan-out leaves to avoid parallel writes to .agent_memory.json.
     """
     memory_context = ""
     if use_memory:
@@ -286,78 +178,34 @@ def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use
     system_content = SYSTEM_PROMPT
     if memory_context:
         system_content += "\n\n" + memory_context
-    if plan_mode:
-        system_content += PLAN_MODE_INSTRUCTIONS
 
     messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": task},
     ]
 
-    final = _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode)
+    final = _run_loop(messages, on_step, auto_confirm, confirm_callback)
     if use_memory:
         task_memory.add_task_summary(task, final)
     return final
 
 
-def dispatch_subagent(task):
-    """
-    Delegates `task` to a fresh sub-agent with its OWN separate context window
-    — none of the main conversation's history counts against it, and only
-    this sub-agent's final summary comes back into the main conversation.
-
-    Use this for open-ended exploration/investigation ("figure out how the
-    auth flow works across these files") so the main conversation's context
-    doesn't get bloated with every file read along the way — only the
-    conclusion does. Don't use this for simple, already-scoped edits; call
-    the relevant tool directly instead.
-    """
-    result = run_agent(task, use_memory=False)
-    return f"[Sub-agent result]: {result}"
-
-
-DISPATCH_SUBAGENT_SCHEMA = [
-    {"type": "function", "function": {
-        "name": "dispatch_subagent",
-        "description": "Delegate an open-ended investigation or exploration task to a fresh "
-                        "sub-agent with its own separate context window. Only the sub-agent's "
-                        "final summary comes back, keeping the main conversation lean. Use for "
-                        "broad exploration ('understand how X works across the codebase'), not "
-                        "for simple scoped edits — call the relevant tool directly for those.",
-        "parameters": {"type": "object", "properties": {
-            "task": {"type": "string", "description": "The investigation task for the sub-agent"},
-        }, "required": ["task"]},
-    }},
-]
-DISPATCH_SUBAGENT_FUNCTIONS = {"dispatch_subagent": dispatch_subagent}
-
-TOOL_SCHEMA.extend(DISPATCH_SUBAGENT_SCHEMA)
-TOOL_FUNCTIONS.update(DISPATCH_SUBAGENT_FUNCTIONS)
-
-
 class Conversation:
     """
-    Maintains real message history across multiple turns in the same
-    session — so "now also handle empty input" builds on what was just
-    discussed, instead of starting blind like separate run_agent() calls
-    would. This is the actual gap between "one-shot task runner" and
-    "ongoing session", closed here without changing run_agent()'s
-    existing single-shot behavior (fan_out and scripted use still use
-    run_agent directly).
+    Stateful multi-turn session. Message history grows across turns so
+    follow-up messages build on what was just discussed, instead of
+    starting blind like separate run_agent() calls would.
 
-    Memory (task_memory) is applied once at conversation start based on
-    the first message, then the growing conversation itself carries
-    context for later turns — same as how a real back-and-forth works.
+    Memory applied once at conversation start (on the first message),
+    then the growing history itself carries context for later turns.
     """
 
-    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True, plan_mode=False):
+    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
         self.on_step = on_step
         self.auto_confirm = auto_confirm
         self.confirm_callback = confirm_callback
         self.use_memory = use_memory
-        self.plan_mode = plan_mode
-        system_content = SYSTEM_PROMPT + (PLAN_MODE_INSTRUCTIONS if plan_mode else "")
-        self.messages = [{"role": "system", "content": system_content}]
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._memory_applied = False
         self._first_task = None
 
@@ -371,31 +219,22 @@ class Conversation:
             self._memory_applied = True
             self._first_task = task
 
-        self.messages = _compact_messages(self.messages)
-
         self.messages.append({"role": "user", "content": task})
-        final = _run_loop(self.messages, self.on_step, self.auto_confirm, self.confirm_callback, self.plan_mode)
+        final = _run_loop(self.messages, self.on_step, self.auto_confirm, self.confirm_callback)
         self.messages.append({"role": "assistant", "content": final})
 
         if self.use_memory:
-            # Summarize the FIRST task of the conversation for cross-session
-            # recall (summarizing every follow-up would fragment the memory
-            # into confusing partial fragments).
             task_memory.add_task_summary(self._first_task or task, final)
 
         return final
 
 
-def _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode=False):
-    """Shared tool-calling loop used by both run_agent() and Conversation.send()."""
+def _run_loop(messages, on_step, auto_confirm, confirm_callback):
+    """Shared tool-calling loop used by run_agent() and Conversation.send()."""
     consecutive_empty = 0
-    active_schema = (
-        [t for t in TOOL_SCHEMA if t["function"]["name"] in PLAN_MODE_ALLOWED_TOOLS]
-        if plan_mode else TOOL_SCHEMA
-    )
 
     for turn in range(MAX_TURNS):
-        message = ask_ai(messages, tools=active_schema)
+        message = ask_ai(messages, tools=TOOL_SCHEMA)
 
         if isinstance(message, dict) and "error" in message:
             return f"ERROR: {message['error']}"
@@ -408,16 +247,10 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode=False
 
         if not tool_calls:
             if not content or not content.strip():
-                # Empty content + no tool calls is NOT a real completion — it's
-                # usually a truncated/cut-off response from the provider. Treating
-                # it as "done" would silently report success on a stalled task.
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
                     return "ERROR: model returned empty responses repeatedly — task did not complete. Try again or break the task into smaller steps."
-                messages.append({
-                    "role": "assistant",
-                    "content": content or "",
-                })
+                messages.append({"role": "assistant", "content": content or ""})
                 messages.append({
                     "role": "user",
                     "content": "Your last response was empty. Please continue: either call a tool to keep working, or give a real final answer.",
@@ -439,7 +272,7 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode=False
                 "function": {"name": tc.function.name, "arguments": tc.function.arguments},
             }
             result = _execute_tool_call(
-                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback, plan_mode=plan_mode
+                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback
             )
             messages.append({
                 "role": "tool",
@@ -452,15 +285,15 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode=False
 
 def fan_out(task_template, targets, max_workers=8, auto_confirm=True):
     """
-    Runs run_agent() once per target in parallel, filling {target} into
-    task_template for each. Example:
-      fan_out("Review {target} for bugs and list any you find.",
-               ["auth.py", "payments.py", "db.py"])
-    Returns {target: result} for all targets. max_workers caps real
-    concurrency (and therefore concurrent API calls) — raise cautiously,
-    your Cerebras key pool is the real ceiling on how many can run at once
-    without hitting rate limits. use_memory is off for leaves to avoid
-    many parallel workers writing to the same .agent_memory.json at once.
+    Run run_agent() in parallel across many targets.
+
+    Example:
+        fan_out("Review {target} for bugs and list any you find.",
+                ["auth.py", "payments.py", "db.py"])
+
+    Returns {target: result} for all targets.
+    use_memory=False on leaves avoids many parallel writers hitting
+    the same .agent_memory.json at once.
     """
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

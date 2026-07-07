@@ -1,32 +1,11 @@
 """
-custom_tool_registry.py — lets the agent create its OWN new tools when
-none of the existing ones cover what a task needs, and persist them for
-every future session.
+custom_tool_registry.py — lets the agent create its OWN new tools.
 
-How it works:
-1. Agent calls `create_tool(name, description, parameters_json, code)`.
-2. The code is validated BEFORE anything is saved: it must compile, and
-   actually define a callable with the right name, in an isolated
-   namespace — a bad tool never reaches disk.
-3. Once valid, the function's source is appended to custom_tools.py, and
-   its schema (name/description/parameters) is appended to
-   custom_tools_schema.json.
-4. Both files persist across sessions — next time cli.py starts, these
-   tools load automatically alongside the built-in ones, no re-creation
-   needed.
-5. Within the SAME session, the new tool becomes usable on the very next
-   turn — agent.py's TOOL_SCHEMA/TOOL_FUNCTIONS get updated in place right
-   after create_tool runs, not just on next startup.
-
-Safety notes:
-- This does NOT sandbox the generated code beyond syntax/definition
-  validation — a created tool runs with the same filesystem/shell access
-  as every other tool here. That's consistent with how the rest of this
-  project already works (run_bash has real shell access), but worth
-  knowing: a tool the agent writes for itself is not inherently safer
-  than one you wrote.
-- Tool names are restricted to valid Python identifiers to prevent
-  injection through the name field itself.
+UPDATED: self-created tools now run with a hard timeout.
+  - Validation-time exec() (when a tool is first created) is timeout-guarded.
+  - Every call to a loaded custom tool at runtime is wrapped so a hanging
+    tool can't stall the whole agent loop indefinitely.
+  - Unix-only (uses SIGALRM); falls back to no timeout on other platforms.
 """
 
 import ast
@@ -34,46 +13,81 @@ import importlib
 import json
 import os
 import re
+import signal
+import functools
 
 CUSTOM_TOOLS_FILE = "custom_tools.py"
 CUSTOM_SCHEMA_FILE = "custom_tools_schema.json"
 
 _VALID_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-# Modules a self-created tool is allowed to import at definition time.
-# This is NOT a full sandbox (see module docstring) — it's a cheap first
-# gate that stops the obvious cases: a generated "tool" quietly importing
-# os/subprocess/socket/etc. and doing something at exec() time, before the
-# tool is ever even called. Deliberately includes the modules the agent's
-# OWN built-in tools already rely on (json, re, math, etc.) since those are
-# legitimately useful for most tools it would plausibly write; anything
-# needing real filesystem/shell/network access should be a change to the
-# core tools.py instead of a self-created tool.
 _ALLOWED_IMPORTS = {
     "re", "json", "math", "time", "datetime", "collections", "itertools",
     "functools", "string", "textwrap", "difflib", "random", "statistics",
     "typing", "dataclasses", "enum", "decimal", "fractions",
 }
 
+# Hard timeout applied to:
+#   1. the validation exec() when a new tool is created
+#   2. every call to a loaded custom tool at runtime
+TOOL_TIMEOUT_SECONDS = 10
+
+
+class ToolTimeoutError(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise ToolTimeoutError(f"Execution exceeded {TOOL_TIMEOUT_SECONDS}s timeout.")
+
+
+def _run_with_timeout(func, *args, timeout=TOOL_TIMEOUT_SECONDS, **kwargs):
+    """
+    Runs func(*args, **kwargs) with a hard wall-clock timeout using SIGALRM.
+    Unix-only — on platforms without SIGALRM, runs without a timeout guard.
+    """
+    has_alarm = hasattr(signal, "SIGALRM")
+    if not has_alarm:
+        return func(*args, **kwargs)
+
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    old_alarm = signal.alarm(timeout)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if old_alarm:
+            # best-effort restore of any previously pending alarm
+            signal.alarm(old_alarm)
+
+
+def _wrap_with_timeout(fn, name):
+    """Wraps a loaded custom tool function so any call to it is timeout-guarded."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return _run_with_timeout(fn, *args, timeout=TOOL_TIMEOUT_SECONDS, **kwargs)
+        except ToolTimeoutError:
+            return (f"ERROR: custom tool '{name}' was killed after exceeding "
+                    f"{TOOL_TIMEOUT_SECONDS}s. It may be stuck in a loop or blocking call.")
+        except Exception as e:
+            return f"ERROR: custom tool '{name}' raised an exception: {e}"
+    return wrapper
+
 
 def _check_import_safety(tree):
-    """Walks the AST for Import/ImportFrom nodes outside _ALLOWED_IMPORTS.
-    Returns an error message, or None if all imports are allowed (or there
-    are none)."""
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
                 if root not in _ALLOWED_IMPORTS:
                     return (f"Import of '{alias.name}' is not allowed in a self-created tool "
-                            f"(allowed: {', '.join(sorted(_ALLOWED_IMPORTS))}). "
-                            f"If this tool genuinely needs filesystem/shell/network access, "
-                            f"that belongs in tools.py as a reviewed built-in, not a self-created tool.")
+                            f"(allowed: {', '.join(sorted(_ALLOWED_IMPORTS))}).")
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
             if root not in _ALLOWED_IMPORTS:
-                return (f"Import from '{node.module}' is not allowed in a self-created tool "
-                        f"(allowed: {', '.join(sorted(_ALLOWED_IMPORTS))}).")
+                return f"Import from '{node.module}' is not allowed."
     return None
 
 
@@ -100,17 +114,6 @@ def _save_schema(schema_list):
 
 
 def _validate_code_defines_callable(name, code):
-    """
-    Checks, WITHOUT touching disk:
-    1. The code is syntactically valid Python (ast.parse — safer than
-       compile+exec for the first pass, catches syntax errors cleanly).
-    2. It defines exactly a function (or assigns a callable) matching `name`.
-    3. Executing it in an isolated namespace actually produces a callable
-       under that name, with no import of anything destructive at
-       module-level (a light check, not a full sandbox — see module docstring).
-
-    Returns (ok: bool, error_message_or_None).
-    """
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
@@ -129,7 +132,15 @@ def _validate_code_defines_callable(name, code):
 
     namespace = {}
     try:
-        exec(compile(tree, "<custom_tool>", "exec"), namespace)
+        # Timeout-guarded: a tool whose top-level code hangs (e.g. an infinite
+        # loop at module scope) can't stall tool creation indefinitely.
+        _run_with_timeout(
+            exec, compile(tree, "<custom_tool>", "exec"), namespace,
+            timeout=TOOL_TIMEOUT_SECONDS,
+        )
+    except ToolTimeoutError:
+        return False, (f"Code took longer than {TOOL_TIMEOUT_SECONDS}s just to define "
+                        f"(likely a hang at module scope) — not saved.")
     except Exception as e:
         return False, f"Code raised an error when defining it: {e}"
 
@@ -140,18 +151,9 @@ def _validate_code_defines_callable(name, code):
 
 
 def create_tool(name, description, parameters_json, code):
-    """
-    The agent-facing function. Validates and, if valid, permanently saves
-    a new tool.
-
-    `parameters_json` — a JSON string matching the standard OpenAI-style
-    function parameters schema, e.g.:
-      '{"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}'
-    `code` — the full Python function definition as a string, e.g.:
-      "def double(x):\\n    return x * 2"
-    """
+    """Validate and permanently save a new agent-created tool."""
     if not _VALID_NAME.match(name):
-        return f"ERROR: '{name}' is not a valid tool name (use lowercase snake_case, e.g. 'my_tool')."
+        return f"ERROR: '{name}' is not a valid tool name (use lowercase snake_case)."
 
     try:
         parameters = json.loads(parameters_json)
@@ -163,9 +165,8 @@ def create_tool(name, description, parameters_json, code):
         return f"ERROR: tool not saved — {err}"
 
     _ensure_files()
-
     schema_list = _load_schema()
-    schema_list = [s for s in schema_list if s["function"]["name"] != name]  # allow overwrite/fix
+    schema_list = [s for s in schema_list if s["function"]["name"] != name]
     schema_list.append({
         "type": "function",
         "function": {"name": name, "description": description, "parameters": parameters},
@@ -175,20 +176,13 @@ def create_tool(name, description, parameters_json, code):
     with open(CUSTOM_TOOLS_FILE, "a") as f:
         f.write(f"\n\n# --- {name} ---\n{code}\n")
 
-    return f"Tool '{name}' created and saved permanently. Available immediately and in all future sessions."
+    return (f"Tool '{name}' created and saved permanently. Available immediately and in all "
+            f"future sessions. Every call to it is capped at {TOOL_TIMEOUT_SECONDS}s.")
 
 
 def load_custom_tools():
-    """
-    Loads every previously created custom tool from disk: the schema list
-    (for TOOL_SCHEMA) and the actual functions (for TOOL_FUNCTIONS), by
-    importing/reloading custom_tools.py.
-
-    Returns (schema_list, functions_dict, errors_list). A tool whose code
-    fails to load for some reason (e.g. the file was hand-edited badly)
-    is skipped with an error reported, rather than crashing the whole
-    agent on startup.
-    """
+    """Load all previously created tools. Returns (schema_list, functions_dict, errors_list).
+    Every returned function is wrapped with a runtime timeout guard."""
     _ensure_files()
     schema_list = _load_schema()
     functions = {}
@@ -207,9 +201,9 @@ def load_custom_tools():
         fn_name = entry["function"]["name"]
         fn = getattr(module, fn_name, None)
         if fn is None or not callable(fn):
-            errors.append(f"Tool '{fn_name}' is in schema but missing/broken in {CUSTOM_TOOLS_FILE} — skipped.")
+            errors.append(f"Tool '{fn_name}' is in schema but missing/broken — skipped.")
             continue
-        functions[fn_name] = fn
+        functions[fn_name] = _wrap_with_timeout(fn, fn_name)
         valid_schema.append(entry)
 
     return valid_schema, functions, errors
@@ -219,18 +213,15 @@ CREATE_TOOL_SCHEMA = [
     {"type": "function", "function": {
         "name": "create_tool",
         "description": "Create and PERMANENTLY save a new tool/function when no existing tool "
-                        "covers what the current task needs. The tool becomes available "
-                        "immediately in this session and automatically in all future sessions. "
-                        "Only use this when genuinely no combination of existing tools can do "
-                        "the job — prefer existing tools whenever possible.",
+                        "covers what the current task needs. Available immediately and in all "
+                        "future sessions, and every call to it is capped at "
+                        f"{TOOL_TIMEOUT_SECONDS}s. Only use when genuinely no combination of "
+                        "existing tools can do the job.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "lowercase snake_case function name"},
-            "description": {"type": "string", "description": "what this tool does, for future tool selection"},
-            "parameters_json": {"type": "string",
-                                 "description": "JSON string: standard OpenAI function-parameters "
-                                                 "schema, e.g. '{\"type\":\"object\",\"properties\":"
-                                                 "{\"x\":{\"type\":\"integer\"}},\"required\":[\"x\"]}'"},
-            "code": {"type": "string", "description": "full Python function definition matching `name`"},
+            "description": {"type": "string"},
+            "parameters_json": {"type": "string", "description": "OpenAI function-parameters schema as JSON string"},
+            "code": {"type": "string", "description": "full Python function definition matching name"},
         }, "required": ["name", "description", "parameters_json", "code"]},
     }},
 ]

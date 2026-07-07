@@ -1,29 +1,25 @@
 """
 task_memory.py — persistent memory across sessions, per project.
 
-Each project directory gets its own .agent_memory.json (one file, lives
-alongside your code, safe to .gitignore). Every completed task gets a short
-summary appended, stored along with a Gemini embedding of the task text.
-Next time you start a new cli.py run in the same project, the new task gets
-embedded too, and past entries are ranked by real semantic similarity —
-so "authentication broke" correctly recalls a past "fix login bug" entry
-even though they share no words, same idea as your main project's
-semantic_rank() and the town sim's memory.py.
-
-Falls back to simple keyword overlap if GEMINI_API_KEY isn't set or a
-call fails, so this never hard-breaks the agent — it just gets a little
-less smart about recall.
+UPDATED: importance-weighted ranking.
+  - Each stored task summary now carries an `importance` score (1-10).
+  - Ranking combines similarity/keyword-overlap tier with importance, so a
+    highly important lesson from a while ago can outrank a recent-but-trivial one.
+  - Importance is inferred automatically at save time (heuristic keyword scan)
+    unless explicitly passed in.
 """
 
 import json
 import math
 import os
+import re
 import time
 import requests
 
 MEMORY_FILE = ".agent_memory.json"
-MAX_STORED = 200       # don't let this grow unbounded
-MAX_RETRIEVED = 5       # how many past summaries get fed into a new task
+MAX_STORED = 200
+MAX_RETRIEVED = 5
+DEFAULT_IMPORTANCE = 5
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_EMBED_MODEL = "gemini-embedding-001"
@@ -32,9 +28,17 @@ GEMINI_EMBED_URL = (
     f"{GEMINI_EMBED_MODEL}:embedContent?key={{key}}"
 )
 
+# Heuristic keyword bumps used when importance isn't explicitly provided.
+_HIGH_IMPORTANCE_MARKERS = [
+    "critical", "bug", "fixed", "broke", "regression", "security", "data loss",
+    "crash", "failed", "important", "never do", "do not", "gotcha", "careful",
+    "corrupt", "irreversible",
+]
+_LOW_IMPORTANCE_MARKERS = ["typo", "minor", "cosmetic", "formatting", "rename"]
+
 
 def _embed(text):
-    """Returns an embedding vector for `text`, or None if unavailable/failed."""
+    """Returns an embedding vector for text, or None if unavailable/failed."""
     if not GEMINI_API_KEY:
         return None
     try:
@@ -60,14 +64,34 @@ def _cosine_similarity(a, b):
     return dot / (norm_a * norm_b)
 
 
+def _infer_importance(task, summary):
+    """Heuristic 1-10 importance score when the caller doesn't supply one explicitly."""
+    text = f"{task} {summary}".lower()
+    score = DEFAULT_IMPORTANCE
+    if any(marker in text for marker in _HIGH_IMPORTANCE_MARKERS):
+        score += 3
+    if any(marker in text for marker in _LOW_IMPORTANCE_MARKERS):
+        score -= 2
+    return max(1, min(10, score))
+
+
 def _load(memory_path):
     if not os.path.exists(memory_path):
         return []
     try:
         with open(memory_path, "r") as f:
-            return json.load(f)
+            entries = json.load(f)
     except (json.JSONDecodeError, OSError):
         return []
+    # Backfill importance for entries saved before this update existed.
+    changed = False
+    for e in entries:
+        if "importance" not in e:
+            e["importance"] = _infer_importance(e.get("task", ""), e.get("summary", ""))
+            changed = True
+    if changed:
+        _save(memory_path, entries)
+    return entries
 
 
 def _save(memory_path, entries):
@@ -77,27 +101,31 @@ def _save(memory_path, entries):
     os.replace(tmp, memory_path)
 
 
-def add_task_summary(task, summary, memory_path=MEMORY_FILE):
-    """Call this once a task finishes — stores a short record of what was asked
-    and what actually happened, embedded for future semantic recall."""
+def add_task_summary(task, summary, memory_path=MEMORY_FILE, importance=None):
+    """Append a completed task + its outcome to persistent memory.
+    importance: optional explicit 1-10 score; auto-inferred from content if omitted."""
     entries = _load(memory_path)
+    score = importance if importance is not None else _infer_importance(task, summary)
+    score = max(1, min(10, score))
     entries.append({
         "task": task,
         "summary": summary,
         "timestamp": time.time(),
-        "embedding": _embed(task),  # None if Gemini unavailable — handled at retrieval time
+        "importance": score,
+        "embedding": _embed(task),
     })
     _save(memory_path, entries)
 
 
 def retrieve_relevant(task, memory_path=MEMORY_FILE, top_k=MAX_RETRIEVED):
     """
-    Returns the most relevant past entries for a new task.
+    Return the most relevant past entries for a new task.
 
-    Uses real embedding cosine similarity when both the new task and stored
-    entries have embeddings. Falls back to keyword-overlap scoring for any
-    entry (or the whole store) that lacks an embedding — e.g. entries saved
-    before GEMINI_API_KEY was set, or if this call's embedding request fails.
+    Ranking:
+      Tier 1 (embedding cosine > 0.55): sorted by (importance, similarity) —
+        importance breaks ties and can outweigh small similarity gaps, so a
+        highly important but slightly-less-similar memory still surfaces.
+      Tier 0 (keyword overlap fallback): sorted by (importance, overlap count).
     """
     entries = _load(memory_path)
     if not entries:
@@ -106,29 +134,28 @@ def retrieve_relevant(task, memory_path=MEMORY_FILE, top_k=MAX_RETRIEVED):
     query_embedding = _embed(task)
     task_words = set(task.lower().split())
 
-    def score(entry):
-        if query_embedding and entry.get("embedding"):
-            sim = _cosine_similarity(query_embedding, entry["embedding"])
-            return (1, sim, entry["timestamp"])  # tier 1: real semantic score
-        entry_words = set(entry["task"].lower().split())
-        overlap = len(task_words & entry_words)
-        return (0, overlap, entry["timestamp"])  # tier 0: keyword fallback
-
-    ranked = sorted(entries, key=score, reverse=True)
-
     if query_embedding:
-        # With real embeddings, a similarity floor matters more than "any overlap" —
-        # otherwise everything gets pulled in as "relevant" at low confidence.
-        relevant = [
-            e for e in ranked
-            if e.get("embedding") and _cosine_similarity(query_embedding, e["embedding"]) > 0.55
+        scored = [
+            (e, _cosine_similarity(query_embedding, e["embedding"]))
+            for e in entries if e.get("embedding")
         ]
+        relevant = [(e, sim) for e, sim in scored if sim > 0.55]
         if relevant:
-            return relevant[:top_k]
+            # Weight: importance (1-10, normalized) contributes as much as raw similarity,
+            # so an important memory can beat a merely-more-similar trivial one.
+            relevant.sort(
+                key=lambda pair: (pair[1] * 0.6) + (pair[0]["importance"] / 10 * 0.4),
+                reverse=True,
+            )
+            return [e for e, _ in relevant[:top_k]]
 
-    # Fallback path: keyword overlap only
-    relevant = [e for e in ranked if len(task_words & set(e["task"].lower().split())) > 0]
-    return relevant[:top_k]
+    def keyword_score(entry):
+        overlap = len(task_words & set(entry["task"].lower().split()))
+        return (entry.get("importance", DEFAULT_IMPORTANCE), overlap)
+
+    candidates = [e for e in entries if len(task_words & set(e["task"].lower().split())) > 0]
+    candidates.sort(key=keyword_score, reverse=True)
+    return candidates[:top_k]
 
 
 def format_for_prompt(entries):
@@ -136,5 +163,6 @@ def format_for_prompt(entries):
         return ""
     lines = ["Relevant memory from past sessions in this project:"]
     for e in entries:
-        lines.append(f"- Task: \"{e['task']}\" -> {e['summary']}")
+        importance_tag = " [HIGH IMPORTANCE]" if e.get("importance", DEFAULT_IMPORTANCE) >= 8 else ""
+        lines.append(f"- Task: \"{e['task']}\" -> {e['summary']}{importance_tag}")
     return "\n".join(lines)

@@ -1,47 +1,34 @@
 """
-The tick engine — the heart of the simulation.
+tick_engine.py — the heart of the simulation. Each tick = one in-world hour.
 
-Each tick represents one in-world hour. For every agent, we:
-  1. Build a prompt from their personality, routine, relationships, and
-     the most relevant memories
-  2. Ask the LLM what they do/say next
-  3. Log that action to the shared event feed (what the live viewer reads)
-  4. Write it back into that agent's memory (and any other agent involved)
-
-Run with: python tick_engine.py
-
-Configure your API key via environment variable before running:
-  export LLM_API_KEY="your-key-here"
-
-Works with any OpenAI-compatible endpoint (OpenRouter, Groq, Cerebras, etc.)
-by changing LLM_BASE_URL and LLM_MODEL below.
+UPDATED: resume support.
+  - On startup, reads the last logged entry in event_log.json and resumes
+    from the next hour instead of always restarting at Day 0, Hour 0.
+  - If event_log.json doesn't exist yet (fresh start), behaves exactly as before.
 """
 
 import json
 import os
 import time
 import requests
-
 from memory import AgentMemoryStore
 
-# --- Configuration -----------------------------------------------------
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen/qwen3-coder")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
-TICK_HOURS = list(range(24))  # one full day cycle, hour by hour
+TICK_HOURS = list(range(24))
 EVENT_LOG_PATH = "event_log.json"
 AGENTS_PATH = "agents.json"
 
 
 def load_agents():
     with open(AGENTS_PATH, "r") as f:
-        data = json.load(f)
-    return data["agents"]
+        return json.load(f)["agents"]
 
 
 def routine_for_hour(agent, hour):
-    """Find which routine block covers the current hour."""
+    """Find which routine block covers the current hour (handles midnight-wrap ranges)."""
     routine = agent.get("routine", {})
     for time_range, activity in routine.items():
         if time_range == "variable":
@@ -52,7 +39,7 @@ def routine_for_hour(agent, hour):
             if start < end:
                 if start <= hour < end:
                     return activity
-            else:  # wraps past midnight, e.g. "21-6"
+            else:
                 if hour >= start or hour < end:
                     return activity
     return routine.get("variable", "No specific plan this hour.")
@@ -66,7 +53,7 @@ def build_prompt(agent, hour, day, memories):
 
 Personality: {agent['personality']}
 Backstory: {agent.get('backstory', '')}
-Private goal/secret (this quietly influences you, never state it outright unless it truly fits the moment): {agent.get('secret', 'None')}
+Private goal/secret: {agent.get('secret', 'None')}
 
 Current time: Day {day}, Hour {hour}:00
 Your usual routine at this hour: {routine_for_hour(agent, hour)}
@@ -78,34 +65,19 @@ Relevant memories:
 {memory_text}
 
 What do you do or say right now? Respond in 1-3 sentences, third person,
-as a short story beat. Include dialogue in quotes if you speak to someone.
-Stay strictly in character. Do not narrate for other agents, only {agent['name']}.
-"""
+as a short story beat. Stay strictly in character."""
 
 
 def call_llm(prompt: str) -> str:
     if not LLM_API_KEY:
         return f"[NO API KEY SET] Would have prompted: {prompt[:60]}..."
-
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 200,
-    }
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 200}
     try:
         resp = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except requests.exceptions.RequestException as e:
-        # A single failed/rate-limited call used to raise and kill the whole
-        # tick loop (every remaining agent that hour, and every hour after).
-        # Now it just skips this agent's turn for this tick and the sim
-        # keeps running — same resilience pattern as provider_pool.py's ask_ai.
         return f"[API ERROR — skipped this turn] {e}"
     except (KeyError, IndexError, ValueError) as e:
         return f"[MALFORMED RESPONSE — skipped this turn] {e}"
@@ -130,20 +102,57 @@ def run_tick(day, hour, agents, stores):
         memories = store.retrieve_relevant(current_tick=global_tick, top_k=5)
         prompt = build_prompt(agent, hour, day, memories)
         action_text = call_llm(prompt)
-
         log_event(day, hour, agent["name"], action_text)
         store.add(text=action_text, tick=global_tick, importance=5)
+
+
+def _resume_point():
+    """
+    Read the last entry in event_log.json and return the (day, hour) to resume from
+    — i.e. the hour AFTER the last one logged. Returns (0, 0) on a fresh start.
+    """
+    if not os.path.exists(EVENT_LOG_PATH):
+        return 0, 0
+    try:
+        with open(EVENT_LOG_PATH, "r") as f:
+            log = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return 0, 0
+    if not log:
+        return 0, 0
+
+    last = log[-1]
+    last_day = last.get("day", 0)
+    last_hour = last.get("hour", 0)
+
+    next_hour = last_hour + 1
+    if next_hour >= 24:
+        return last_day + 1, 0
+    return last_day, next_hour
 
 
 def main():
     agents = load_agents()
     stores = {a["id"]: AgentMemoryStore(a["id"]) for a in agents}
 
-    day = 0
+    start_day, start_hour = _resume_point()
+    if (start_day, start_hour) != (0, 0):
+        print(f"Resuming simulation from Day {start_day}, Hour {start_hour:02d}:00 "
+              f"(found existing {EVENT_LOG_PATH}).")
+    else:
+        print("Starting fresh simulation at Day 0, Hour 00:00.")
+
+    day = start_day
+    first_day = True
     while True:
-        for hour in TICK_HOURS:
+        hours = TICK_HOURS
+        if first_day and start_hour != 0:
+            hours = [h for h in TICK_HOURS if h >= start_hour]
+        first_day = False
+
+        for hour in hours:
             run_tick(day, hour, agents, stores)
-            time.sleep(1)  # small pause between ticks; tune as needed
+            time.sleep(1)
         day += 1
 
 
