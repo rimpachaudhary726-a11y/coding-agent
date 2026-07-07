@@ -9,13 +9,17 @@
   </style>
 </head>
 <body>
+  <div id="status">Running...</div>
   <script type="module">
+
     // Load Three.js and Rapier from CDN
     import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.158/build/three.module.js';
     import initRapier from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d@0.10.0/rapier.js';
 
     (async () => {
+  
       await initRapier();
+console.log('Rapier initialized');
       const RAPIER = rapier; // global provided by Rapier init script
 
       // ----- Three.js setup -----
@@ -43,6 +47,7 @@
       const groundMesh = new THREE.Mesh(groundGeo, groundMat);
       groundMesh.position.y = -0.5; // align with physics ground
       scene.add(groundMesh);
+console.log('Three.js initialized');
 
       // Ground plane already created as groundMesh
 
@@ -77,6 +82,7 @@
       // ----- Rapier physics setup -----
       const gravity = new RAPIER.Vector3(0, -9.81, 0);
       const world = new RAPIER.World(gravity);
+console.log('Rapier world created');
 
       // Static ground collider (matches ground mesh)
       const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0);
@@ -122,7 +128,11 @@
       });
 
       animate();
-    })();
+    })().catch(e => {
+      console.error(e);
+      const statusDiv = document.getElementById('status');
+      if (statusDiv) statusDiv.textContent = e.message;
+    });
   </script>
 </body>
 </html>

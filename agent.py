@@ -144,6 +144,24 @@ COMPACT_AFTER_MESSAGES = 30   # trigger compaction once history grows past this
 KEEP_RECENT_MESSAGES = 10     # always keep this many most-recent messages verbatim
 
 
+def _safe_cut_index(messages, cut_index):
+    """
+    Ensures a compaction cut point never lands in the middle of a
+    tool-call/tool-result pair — which is exactly what caused a real bug:
+    slicing kept an orphaned 'tool' result message whose matching assistant
+    tool_calls message got summarized away, and Cerebras (correctly)
+    rejected the resulting history as invalid.
+
+    Tool result messages always immediately follow the assistant message
+    that requested them, with nothing else in between — so walking
+    backward past any 'tool' role messages always lands exactly on the
+    assistant message that owns them, keeping the pair intact.
+    """
+    while cut_index > 0 and messages[cut_index]["role"] == "tool":
+        cut_index -= 1
+    return cut_index
+
+
 def _compact_messages(messages):
     """
     Summarizes older conversation history into one compact system-style note,
@@ -160,8 +178,9 @@ def _compact_messages(messages):
         return messages
 
     system_msg = messages[0]
-    recent = messages[-KEEP_RECENT_MESSAGES:]
-    middle = messages[1:-KEEP_RECENT_MESSAGES]
+    cut_index = _safe_cut_index(messages, len(messages) - KEEP_RECENT_MESSAGES)
+    recent = messages[cut_index:]
+    middle = messages[1:cut_index]
 
     if not middle:
         return messages
