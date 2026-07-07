@@ -44,28 +44,58 @@
       groundMesh.position.y = -0.5; // align with physics ground
       scene.add(groundMesh);
 
-      // Box (Three.js mesh)
-      const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-      const boxMat = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
-      const boxMesh = new THREE.Mesh(boxGeo, boxMat);
-      boxMesh.position.set(0, 5, 0);
-      scene.add(boxMesh);
+      // Ground plane already created as groundMesh
+
+      // Helper to create a Three.js mesh and a Rapier body
+      const objects = [];
+      function createBox(size, position, color) {
+        const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
+        const mat = new THREE.MeshStandardMaterial({ color });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.copy(position);
+        scene.add(mesh);
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(position.x, position.y, position.z);
+        const body = world.createRigidBody(bodyDesc);
+        const colliderDesc = RAPIER.ColliderDesc.cuboid(size.x / 2, size.y / 2, size.z / 2);
+        world.createCollider(colliderDesc, body);
+        objects.push({ mesh, body });
+      }
+
+      function createSphere(radius, position, color) {
+        const geo = new THREE.SphereGeometry(radius, 32, 32);
+        const mat = new THREE.MeshStandardMaterial({ color });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.copy(position);
+        scene.add(mesh);
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(position.x, position.y, position.z);
+        const body = world.createRigidBody(bodyDesc);
+        const colliderDesc = RAPIER.ColliderDesc.ball(radius);
+        world.createCollider(colliderDesc, body);
+        objects.push({ mesh, body });
+      }
 
       // ----- Rapier physics setup -----
       const gravity = new RAPIER.Vector3(0, -9.81, 0);
       const world = new RAPIER.World(gravity);
 
-      // Static ground collider
+      // Static ground collider (matches ground mesh)
       const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0);
       const groundBody = world.createRigidBody(groundBodyDesc);
       const groundColliderDesc = RAPIER.ColliderDesc.cuboid(10, 0.5, 10);
       world.createCollider(groundColliderDesc, groundBody);
 
-      // Dynamic box collider
-      const boxBodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(0, 5, 0);
-      const boxBody = world.createRigidBody(boxBodyDesc);
-      const boxColliderDesc = RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5);
-      world.createCollider(boxColliderDesc, boxBody);
+      // Create some falling boxes and spheres
+      const colors = [0xff0000, 0x00ff00, 0x0000ff, 0xffff00];
+      for (let i = 0; i < 5; i++) {
+        const size = new THREE.Vector3(1, 1, 1);
+        const pos = new THREE.Vector3((Math.random() - 0.5) * 8, 5 + i * 2, (Math.random() - 0.5) * 8);
+        createBox(size, pos, colors[i % colors.length]);
+      }
+      for (let i = 0; i < 5; i++) {
+        const radius = 0.5;
+        const pos = new THREE.Vector3((Math.random() - 0.5) * 8, 8 + i * 2, (Math.random() - 0.5) * 8);
+        createSphere(radius, pos, colors[(i + 2) % colors.length]);
+      }
 
       const timeStep = 1 / 60;
 
@@ -73,11 +103,13 @@
         requestAnimationFrame(animate);
         world.step(); // advance physics simulation
 
-        // Sync Three.js mesh with Rapier body
-        const pos = boxBody.translation();
-        const rot = boxBody.rotation();
-        boxMesh.position.set(pos.x, pos.y, pos.z);
-        boxMesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+        // Sync all objects
+        for (const obj of objects) {
+          const pos = obj.body.translation();
+          const rot = obj.body.rotation();
+          obj.mesh.position.set(pos.x, pos.y, pos.z);
+          obj.mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+        }
 
         renderer.render(scene, camera);
       }
