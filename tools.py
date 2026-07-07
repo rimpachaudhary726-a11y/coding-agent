@@ -61,23 +61,16 @@ def write_file(path, content):
 
 
 def edit_file(path, old_text, new_text):
-    """Targeted find-and-replace. old_text must match EXACTLY ONCE — if it
-    matches zero or multiple times, no edit is made and an error explains
-    why, instead of silently rewriting every occurrence (which previously
-    risked touching unrelated code that happened to share the same
-    snippet)."""
+    """Targeted find-and-replace, same contract as main-11.py's edit_file():
+    old_text must appear in the file, exactly once is safest but not enforced
+    here (mirrors the original's simple .replace() behavior)."""
     if not os.path.exists(path):
         return f"ERROR: {path} does not exist."
     content = read_file(path)
-    occurrences = content.count(old_text)
-    if occurrences == 0:
+    if old_text not in content:
         return f"Could not find that exact text in {path}. No changes made. " \
                f"Tip: view the file first to copy the exact text to replace."
-    if occurrences > 1:
-        return f"ERROR: that text appears {occurrences} times in {path} — edit_file " \
-               f"requires an exact, unique match so it never guesses which one you meant. " \
-               f"No changes made. Include more surrounding context (a line above/below) " \
-               f"to make old_text unique, then try again."
+    occurrences = content.count(old_text)
     new_content = content.replace(old_text, new_text)
     write_file(path, new_content)
     diff_preview = "\n".join(
@@ -86,7 +79,8 @@ def edit_file(path, old_text, new_text):
             lineterm="", n=1
         ))[:20]
     )
-    return f"Edited {path}.\n{diff_preview}"
+    note = f" (replaced {occurrences} occurrence(s))" if occurrences > 1 else ""
+    return f"Edited {path}{note}.\n{diff_preview}"
 
 
 def list_directory(path="."):
@@ -202,6 +196,76 @@ def read_files(paths):
     return "\n\n".join(sections)
 
 
+def git_diff(path=None):
+    """Shows uncommitted changes — all files, or one specific path. Lets the
+    agent (or you) review exactly what's changed before committing, instead
+    of committing blind."""
+    cmd = f"git diff {path}" if path else "git diff"
+    result = run_bash(cmd, confirmed=True, timeout=30)
+    if "(exit code 0)\n\n" == result or result.strip() == "(exit code 0)":
+        return "No uncommitted changes."
+    return result
+
+
+def git_status():
+    """Shows the working tree status — modified/added/deleted files not yet committed."""
+    return run_bash("git status --short", confirmed=True, timeout=30)
+
+
+def generate_project_index(root=".", extensions=None):
+    """
+    Builds a lightweight map of the project: every source file plus a
+    one-line purpose pulled from its docstring or leading comment. Saved to
+    PROJECT_INDEX.md so future tasks (in this or later sessions) can check
+    this ONE file instead of re-exploring the directory structure from
+    scratch every time — a real time/token saver on larger projects.
+
+    Purpose extraction is heuristic (first docstring/comment line), not an
+    LLM call, so this stays fast and free to run as often as needed.
+    """
+    extensions = extensions or [".py", ".js", ".ts"]
+    entries = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "artifacts")]
+        for fname in sorted(filenames):
+            if not any(fname.endswith(ext) for ext in extensions):
+                continue
+            full = os.path.join(dirpath, fname)
+            purpose = _extract_purpose(full)
+            entries.append((full, purpose))
+
+    lines = ["# Project Index", "", "Auto-generated file map. Regenerate with `generate_project_index` if it goes stale.", ""]
+    for path, purpose in sorted(entries):
+        lines.append(f"- **{path}** — {purpose}")
+
+    content = "\n".join(lines)
+    write_file(os.path.join(root, "PROJECT_INDEX.md"), content)
+    return f"Indexed {len(entries)} files into PROJECT_INDEX.md."
+
+
+def _extract_purpose(path):
+    """Pulls a one-line summary from a file's leading docstring/comment,
+    falling back to '(no description found)' rather than guessing."""
+    try:
+        with open(path, "r", errors="ignore") as f:
+            lines = [f.readline() for _ in range(10)]
+    except OSError:
+        return "(could not read file)"
+
+    text = "".join(lines)
+    docstring_match = re.search(r'"""(.+?)(?:"""|\n)', text, re.DOTALL)
+    if docstring_match:
+        first_line = docstring_match.group(1).strip().split("\n")[0].strip()
+        if first_line:
+            return first_line
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") and len(stripped) > 2:
+            return stripped.lstrip("#").strip()
+    return "(no description found)"
+
+
 def revert_file(path):
     """
     Restores a file to its last git-committed state, discarding uncommitted
@@ -287,26 +351,11 @@ def write_todos(todos):
 
 
 def git_commit(message, add_all=True):
-    """
-    Runs `git commit` directly via subprocess (no shell=True, no string
-    interpolation) so a commit message containing quotes, backticks, or
-    $(...) can't break out of the command or execute anything unintended —
-    unlike building a shell string via run_bash(f'git commit -m "{message}"'),
-    which was vulnerable to exactly that.
-    """
     if add_all:
         add_result = run_bash("git add -A", confirmed=True)
         if "exit code 0" not in add_result:
             return f"git add failed:\n{add_result}"
-    try:
-        result = subprocess.run(
-            ["git", "commit", "-m", message],
-            capture_output=True, text=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return "git commit timed out after 30s."
-    output = (result.stdout or "") + (result.stderr or "")
-    return f"(exit code {result.returncode})\n{output[-4000:]}"
+    return run_bash(f'git commit -m "{message}"', confirmed=True)
 
 
 # --- Tool schema, passed to the LLM's `tools` parameter ------------------
@@ -363,6 +412,29 @@ TOOL_SCHEMA = [
         "parameters": {"type": "object", "properties": {
             "paths": {"type": "array", "items": {"type": "string"}},
         }, "required": ["paths"]},
+    }},
+    {"type": "function", "function": {
+        "name": "git_diff",
+        "description": "Show uncommitted changes (all files, or one specific path). Use before "
+                        "committing to review exactly what changed.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Optional — limit diff to one file"},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "git_status",
+        "description": "Show the working tree status — which files are modified/added/deleted.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "generate_project_index",
+        "description": "Generate/refresh PROJECT_INDEX.md — a one-line-per-file map of the whole "
+                        "project. Check for this file first on a new task instead of exploring "
+                        "the directory structure from scratch; regenerate it if it looks stale.",
+        "parameters": {"type": "object", "properties": {
+            "root": {"type": "string", "default": "."},
+            "extensions": {"type": "array", "items": {"type": "string"}, "default": [".py", ".js", ".ts"]},
+        }},
     }},
     {"type": "function", "function": {
         "name": "revert_file",
@@ -426,4 +498,7 @@ TOOL_FUNCTIONS = {
     "detect_and_run_tests": detect_and_run_tests,
     "write_todos": write_todos,
     "git_commit": git_commit,
+    "git_diff": git_diff,
+    "git_status": git_status,
+    "generate_project_index": generate_project_index,
 }

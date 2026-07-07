@@ -54,6 +54,8 @@ TOOL_FUNCTIONS = {
     **TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS,
     **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **_custom_functions,
 }
+# dispatch_subagent and its schema/function dict are defined further down (they
+# reference run_agent), then merged in right after their definition — see below.
 
 
 def _refresh_custom_tools():
@@ -80,10 +82,14 @@ change anything, make the smallest correct change, and verify your work \
 (run tests or the relevant command) before declaring the task done. \
 When a task is genuinely finished, reply with plain text and no further tool calls.
 
-When looking for a file, check the project root first (list_directory(".")) \
-before searching subfolders. Ignore artifacts/, node_modules/, lib/, .cache/, \
-and other tooling/dependency folders unless the user's request specifically \
-points there — the user's own code almost always lives at the project root.
+When looking for a file, check for PROJECT_INDEX.md first (read_file) — if \
+it exists, use it to go straight to the right file instead of exploring \
+from scratch. If it doesn't exist yet on a non-trivial project, consider \
+calling generate_project_index once early on to build it. Otherwise, check \
+the project root first (list_directory(".")) before searching subfolders. \
+Ignore artifacts/, node_modules/, lib/, .cache/, and other tooling/dependency \
+folders unless the user's request specifically points there — the user's \
+own code almost always lives at the project root.
 
 If the project has a test suite, call detect_and_run_tests after making code \
 changes, before declaring the task done — don't just assume a fix works.
@@ -114,11 +120,81 @@ before trying a different approach, rather than layering more changes on \
 top of a broken one. Only works on files already tracked by git; check the \
 result and fall back to fixing forward if revert isn't available."""
 
+# Tools allowed in PLAN MODE — pure investigation, nothing that writes, edits,
+# runs arbitrary commands, or touches git/GitHub. write_todos IS allowed since
+# presenting the plan is the whole point of this mode.
+PLAN_MODE_ALLOWED_TOOLS = {
+    "read_file", "read_files", "list_directory", "search_codebase",
+    "detect_and_run_tests", "write_todos", "dispatch_subagent",
+    "git_diff", "git_status", "generate_project_index",
+}
+
+PLAN_MODE_INSTRUCTIONS = """
+
+You are in PLAN MODE. You can freely investigate — read files, search the \
+codebase, run tests — but you CANNOT write, edit, run shell commands, or \
+touch git/GitHub in this mode; those tools are unavailable to you right now. \
+Your job is only to investigate and propose a plan. When you understand the \
+task, call write_todos with the concrete steps you'd take, then stop — do \
+not attempt anything further. The person will review your plan and decide \
+whether to have it actually executed."""
+
 MAX_TURNS = 40
+COMPACT_AFTER_MESSAGES = 30   # trigger compaction once history grows past this
+KEEP_RECENT_MESSAGES = 10     # always keep this many most-recent messages verbatim
 
 
-def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None):
+def _compact_messages(messages):
+    """
+    Summarizes older conversation history into one compact system-style note,
+    keeping the original system prompt and the most recent messages verbatim.
+    This is what prevents a long Conversation session from eventually hitting
+    a token limit and breaking — same problem real Claude Code's context
+    compaction solves.
+
+    Returns a new messages list: [original_system, compacted_summary, ...recent].
+    If summarization itself fails (API error), returns the original list
+    unchanged rather than losing history.
+    """
+    if len(messages) <= COMPACT_AFTER_MESSAGES:
+        return messages
+
+    system_msg = messages[0]
+    recent = messages[-KEEP_RECENT_MESSAGES:]
+    middle = messages[1:-KEEP_RECENT_MESSAGES]
+
+    if not middle:
+        return messages
+
+    transcript = "\n".join(
+        f"{m.get('role', '?')}: {str(m.get('content') or m.get('tool_calls') or '')[:300]}"
+        for m in middle
+    )
+    summary_prompt = (
+        "Summarize this part of a coding session in 3-6 sentences: what was "
+        "asked, what was done, what files were touched, and any decisions or "
+        "facts worth remembering for later steps. Be concrete, not vague.\n\n"
+        f"{transcript}"
+    )
+    summary_response = ask_ai([{"role": "user", "content": summary_prompt}], max_tokens=400)
+    if isinstance(summary_response, dict) and "error" in summary_response:
+        return messages  # summarization failed — keep full history rather than losing it
+
+    summary_text = summary_response.get("content") if isinstance(summary_response, dict) else summary_response.content
+    if not summary_text:
+        return messages
+
+    summary_msg = {"role": "system", "content": f"[Earlier in this session]: {summary_text.strip()}"}
+    return [system_msg, summary_msg] + recent
+
+
+def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None, plan_mode=False):
     name = tool_call["function"]["name"]
+
+    if plan_mode and name not in PLAN_MODE_ALLOWED_TOOLS:
+        return (f"ERROR: '{name}' is not available in plan mode — you can only investigate "
+                f"right now (read/search/list/test tools). Propose your plan via write_todos instead.")
+
     try:
         args = json.loads(tool_call["function"]["arguments"] or "{}")
     except json.JSONDecodeError:
@@ -159,7 +235,7 @@ def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=No
     return result
 
 
-def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
+def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True, plan_mode=False):
     """
     Runs the core tool-calling loop for a SINGLE, standalone task until the
     model stops calling tools or MAX_TURNS is hit. Each call starts a fresh
@@ -175,6 +251,11 @@ def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use
     `use_memory` — pull in relevant past-session summaries for this project
         and save a summary of this task when it finishes. Set False for
         fan-out leaves to avoid many parallel writers hitting the same file.
+    `plan_mode` — restricts the agent to read-only investigation tools and
+        instructs it to propose a plan (via write_todos) instead of acting.
+        No writes, edits, shell commands, or git/GitHub actions can happen,
+        enforced both by hiding those tools from the schema AND rejecting
+        them at execution time as a second safety layer.
 
     Returns the final plain-text response.
     """
@@ -186,16 +267,53 @@ def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use
     system_content = SYSTEM_PROMPT
     if memory_context:
         system_content += "\n\n" + memory_context
+    if plan_mode:
+        system_content += PLAN_MODE_INSTRUCTIONS
 
     messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": task},
     ]
 
-    final = _run_loop(messages, on_step, auto_confirm, confirm_callback)
+    final = _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode)
     if use_memory:
         task_memory.add_task_summary(task, final)
     return final
+
+
+def dispatch_subagent(task):
+    """
+    Delegates `task` to a fresh sub-agent with its OWN separate context window
+    — none of the main conversation's history counts against it, and only
+    this sub-agent's final summary comes back into the main conversation.
+
+    Use this for open-ended exploration/investigation ("figure out how the
+    auth flow works across these files") so the main conversation's context
+    doesn't get bloated with every file read along the way — only the
+    conclusion does. Don't use this for simple, already-scoped edits; call
+    the relevant tool directly instead.
+    """
+    result = run_agent(task, use_memory=False)
+    return f"[Sub-agent result]: {result}"
+
+
+DISPATCH_SUBAGENT_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "dispatch_subagent",
+        "description": "Delegate an open-ended investigation or exploration task to a fresh "
+                        "sub-agent with its own separate context window. Only the sub-agent's "
+                        "final summary comes back, keeping the main conversation lean. Use for "
+                        "broad exploration ('understand how X works across the codebase'), not "
+                        "for simple scoped edits — call the relevant tool directly for those.",
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "The investigation task for the sub-agent"},
+        }, "required": ["task"]},
+    }},
+]
+DISPATCH_SUBAGENT_FUNCTIONS = {"dispatch_subagent": dispatch_subagent}
+
+TOOL_SCHEMA.extend(DISPATCH_SUBAGENT_SCHEMA)
+TOOL_FUNCTIONS.update(DISPATCH_SUBAGENT_FUNCTIONS)
 
 
 class Conversation:
@@ -213,12 +331,14 @@ class Conversation:
     context for later turns — same as how a real back-and-forth works.
     """
 
-    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
+    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True, plan_mode=False):
         self.on_step = on_step
         self.auto_confirm = auto_confirm
         self.confirm_callback = confirm_callback
         self.use_memory = use_memory
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.plan_mode = plan_mode
+        system_content = SYSTEM_PROMPT + (PLAN_MODE_INSTRUCTIONS if plan_mode else "")
+        self.messages = [{"role": "system", "content": system_content}]
         self._memory_applied = False
         self._first_task = None
 
@@ -232,8 +352,10 @@ class Conversation:
             self._memory_applied = True
             self._first_task = task
 
+        self.messages = _compact_messages(self.messages)
+
         self.messages.append({"role": "user", "content": task})
-        final = _run_loop(self.messages, self.on_step, self.auto_confirm, self.confirm_callback)
+        final = _run_loop(self.messages, self.on_step, self.auto_confirm, self.confirm_callback, self.plan_mode)
         self.messages.append({"role": "assistant", "content": final})
 
         if self.use_memory:
@@ -245,12 +367,16 @@ class Conversation:
         return final
 
 
-def _run_loop(messages, on_step, auto_confirm, confirm_callback):
+def _run_loop(messages, on_step, auto_confirm, confirm_callback, plan_mode=False):
     """Shared tool-calling loop used by both run_agent() and Conversation.send()."""
     consecutive_empty = 0
+    active_schema = (
+        [t for t in TOOL_SCHEMA if t["function"]["name"] in PLAN_MODE_ALLOWED_TOOLS]
+        if plan_mode else TOOL_SCHEMA
+    )
 
     for turn in range(MAX_TURNS):
-        message = ask_ai(messages, tools=TOOL_SCHEMA)
+        message = ask_ai(messages, tools=active_schema)
 
         if isinstance(message, dict) and "error" in message:
             return f"ERROR: {message['error']}"
@@ -294,7 +420,7 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback):
                 "function": {"name": tc.function.name, "arguments": tc.function.arguments},
             }
             result = _execute_tool_call(
-                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback
+                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback, plan_mode=plan_mode
             )
             messages.append({
                 "role": "tool",

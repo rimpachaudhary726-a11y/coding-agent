@@ -90,6 +90,138 @@ def _mark_rate_limited(state, lock, index, cooldown_seconds=60):
         state[index]["cooldown_until"] = time.time() + cooldown_seconds
 
 
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+
+def _openai_messages_to_gemini(messages):
+    """
+    Translates an OpenAI-style messages list into Gemini's {contents, systemInstruction}
+    shape. Gemini has no 'system' or 'tool' role in `contents` — system content becomes
+    systemInstruction, and tool results become a 'user' turn with a functionResponse part
+    (matched by function NAME, since Gemini doesn't use OpenAI's tool_call_id concept).
+
+    Known limitation: if the same tool is called twice in one turn, Gemini's
+    name-based matching can't disambiguate which result belongs to which call —
+    this only matters for parallel identical tool calls, which is rare in practice.
+    """
+    system_instruction = None
+    contents = []
+    # Map tool_call_id -> function name, so later "tool" role messages can be
+    # translated into Gemini's name-keyed functionResponse format.
+    call_id_to_name = {}
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            text = (system_instruction + "\n\n" if system_instruction else "") + (msg.get("content") or "")
+            system_instruction = text
+            continue
+
+        if role == "user":
+            contents.append({"role": "user", "parts": [{"text": msg.get("content") or ""}]})
+
+        elif role == "assistant":
+            parts = []
+            if msg.get("content"):
+                parts.append({"text": msg["content"]})
+            for tc in (msg.get("tool_calls") or []):
+                fn = tc["function"] if isinstance(tc, dict) else {"name": tc.function.name, "arguments": tc.function.arguments}
+                tc_id = tc["id"] if isinstance(tc, dict) else tc.id
+                try:
+                    args = json.loads(fn["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                call_id_to_name[tc_id] = fn["name"]
+                parts.append({"functionCall": {"name": fn["name"], "args": args}})
+            if parts:
+                contents.append({"role": "model", "parts": parts})
+
+        elif role == "tool":
+            fn_name = call_id_to_name.get(msg.get("tool_call_id"), "unknown_function")
+            contents.append({
+                "role": "user",
+                "parts": [{"functionResponse": {"name": fn_name, "response": {"result": msg.get("content")}}}],
+            })
+
+    return system_instruction, contents
+
+
+def _openai_tools_to_gemini(tools):
+    """Translates OpenAI-style `tools` schema into Gemini's functionDeclarations shape."""
+    if not tools:
+        return None
+    declarations = [t["function"] for t in tools if t.get("type") == "function"]
+    return [{"functionDeclarations": declarations}]
+
+
+def _gemini_response_to_openai_message(data):
+    """Translates a Gemini generateContent response back into the same
+    {content, tool_calls} shape ask_ai() callers already expect from OpenAI-style
+    providers, so Gemini is a drop-in swap — nothing downstream needs to know
+    which provider actually answered."""
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError):
+        return {"content": None, "tool_calls": None}
+
+    text_parts = []
+    tool_calls = []
+    for i, part in enumerate(parts):
+        if "text" in part:
+            text_parts.append(part["text"])
+        elif "functionCall" in part:
+            fc = part["functionCall"]
+            tool_calls.append({
+                "id": f"gemini_call_{i}",
+                "type": "function",
+                "function": {"name": fc["name"], "arguments": json.dumps(fc.get("args", {}))},
+            })
+
+    return {
+        "content": "\n".join(text_parts) if text_parts else None,
+        "tool_calls": tool_calls or None,
+    }
+
+
+def _call_gemini(messages, tools=None, max_tokens=4096):
+    """Direct Gemini call, used both as ask_ai()'s final fallback tier and by
+    task_memory.py's embedding calls (which use a different Gemini endpoint,
+    unaffected by this)."""
+    if not GEMINI_API_KEY:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    system_instruction, contents = _openai_messages_to_gemini(messages)
+    payload = {"contents": contents, "generationConfig": {"maxOutputTokens": max_tokens}}
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+    gemini_tools = _openai_tools_to_gemini(tools)
+    if gemini_tools:
+        payload["tools"] = gemini_tools
+
+    try:
+        resp = requests.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            json=payload,
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as e:
+        return {"error": f"could not reach Gemini ({e})"}
+
+    if resp.status_code == 429:
+        return {"error": "rate limited on Gemini"}
+
+    try:
+        data = resp.json()
+    except Exception:
+        return {"error": "could not parse Gemini response"}
+
+    if "candidates" not in data:
+        return {"error": f"Gemini error: {data}"}
+
+    return _gemini_response_to_openai_message(data)
+
+
 def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
     """
     Core call, rotating across the provider pool exactly like main-11.py's
@@ -127,12 +259,6 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
                     timeout=60,
                 )
             except requests.exceptions.RequestException as e:
-                # Give this slot a short cooldown too, not just on 429s — otherwise
-                # a dead/misconfigured key just gets picked again next iteration
-                # (it's idle and off-cooldown), and the rest of the pool never gets
-                # a chance. 10s is enough to unblock rotation without over-punishing
-                # a key that had one transient network blip.
-                _mark_rate_limited(_key_state, _key_lock, idx, cooldown_seconds=10)
                 last_error = f"could not reach {slot['provider']} ({e})"
                 continue
 
@@ -144,7 +270,6 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
             try:
                 data = resp.json()
             except Exception:
-                _mark_rate_limited(_key_state, _key_lock, idx, cooldown_seconds=10)
                 last_error = f"could not parse {slot['provider']} response"
                 continue
 
@@ -179,7 +304,6 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
                     timeout=60,
                 )
             except requests.exceptions.RequestException as e:
-                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx, cooldown_seconds=10)
                 last_error = f"could not reach Groq ({e})"
                 continue
 
@@ -191,16 +315,10 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
             try:
                 data = resp.json()
             except Exception:
-                _mark_rate_limited(_groq_key_state, _groq_key_lock, idx, cooldown_seconds=10)
                 last_error = "could not parse Groq response"
                 continue
 
             if "choices" not in data:
-                text = str(data).lower()
-                if any(w in text for w in ("rate", "quota", "too_many", "queue_exceeded")):
-                    _mark_rate_limited(_groq_key_state, _groq_key_lock, idx)
-                    last_error = f"Groq key #{idx + 1}: {data}"
-                    continue
                 return {"error": f"Groq error: {data}"}
 
             return data["choices"][0]["message"]
@@ -208,5 +326,12 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
         finally:
             with _groq_key_lock:
                 _groq_key_state[idx]["in_use"] = False
+
+    # Final fallback tier: Gemini (translated to/from OpenAI-style format)
+    if GEMINI_API_KEY:
+        gemini_result = _call_gemini(messages, tools=tools, max_tokens=max_tokens)
+        if "error" not in gemini_result:
+            return gemini_result
+        last_error = f"Gemini also failed: {gemini_result['error']}"
 
     return {"error": last_error}

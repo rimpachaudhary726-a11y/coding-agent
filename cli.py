@@ -50,18 +50,15 @@ def _ask_confirmation(command):
 
 def main():
     print("=== Coding Agent CLI ===")
-    print("Type your task, or 'quit' to exit.\n")
+    print("Type your task, or 'quit' to exit.")
+    print("Prefix a task with 'plan: ' to investigate and propose a plan first, without changing anything.\n")
 
     if len(sys.argv) > 1:
-        # One-shot mode — no follow-up needed, run_agent is fine as-is.
         task = " ".join(sys.argv[1:])
         result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
         print(f"\n✅ {result}")
         return
 
-    # Interactive mode — real conversation memory across turns, so "also
-    # handle empty input" builds on what was just discussed rather than
-    # starting blind each time.
     conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
 
     while True:
@@ -79,6 +76,22 @@ def main():
             conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
             print("(started a fresh conversation)")
             continue
+
+        if task.lower().startswith("plan:"):
+            real_task = task[len("plan:"):].strip()
+            print("\n🔒 Plan mode — investigating only, nothing will be changed yet.")
+            plan_result = run_agent(
+                real_task, on_step=_print_step, use_memory=False, plan_mode=True
+            )
+            print(f"\n📋 {plan_result}")
+            approve = input("\nExecute this now with full tools? [y/N] ").strip().lower()
+            if approve == "y":
+                result = conversation.send(real_task)
+                print(f"\n✅ {result}")
+            else:
+                print("(not executed)")
+            continue
+
         result = conversation.send(task)
         print(f"\n✅ {result}")
 

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Three.js + Rapier Demo</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <script type="module">
+    // Load Three.js and Rapier from CDN
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.158/build/three.module.js';
+    import initRapier from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d@0.10.0/rapier.js';
+
+    (async () => {
+      await initRapier();
+      const RAPIER = rapier; // global provided by Rapier init script
+
+      // ----- Three.js setup -----
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        100
+      );
+      camera.position.set(0, 5, 10);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      // Light
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+      dirLight.position.set(5, 10, 7);
+      scene.add(dirLight);
+
+      // Ground (Three.js mesh)
+      const groundGeo = new THREE.BoxGeometry(20, 1, 20);
+      const groundMat = new THREE.MeshStandardMaterial({ color: 0x808080 });
+      const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+      groundMesh.position.y = -0.5; // align with physics ground
+      scene.add(groundMesh);
+
+      // Box (Three.js mesh)
+      const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+      const boxMat = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+      const boxMesh = new THREE.Mesh(boxGeo, boxMat);
+      boxMesh.position.set(0, 5, 0);
+      scene.add(boxMesh);
+
+      // ----- Rapier physics setup -----
+      const gravity = new RAPIER.Vector3(0, -9.81, 0);
+      const world = new RAPIER.World(gravity);
+
+      // Static ground collider
+      const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0);
+      const groundBody = world.createRigidBody(groundBodyDesc);
+      const groundColliderDesc = RAPIER.ColliderDesc.cuboid(10, 0.5, 10);
+      world.createCollider(groundColliderDesc, groundBody);
+
+      // Dynamic box collider
+      const boxBodyDesc = RAPIER.RigidBodyDesc.dynamic().setTranslation(0, 5, 0);
+      const boxBody = world.createRigidBody(boxBodyDesc);
+      const boxColliderDesc = RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5);
+      world.createCollider(boxColliderDesc, boxBody);
+
+      const timeStep = 1 / 60;
+
+      function animate() {
+        requestAnimationFrame(animate);
+        world.step(); // advance physics simulation
+
+        // Sync Three.js mesh with Rapier body
+        const pos = boxBody.translation();
+        const rot = boxBody.rotation();
+        boxMesh.position.set(pos.x, pos.y, pos.z);
+        boxMesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+
+        renderer.render(scene, camera);
+      }
+
+      // Handle window resize
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      animate();
+    })();
+  </script>
+</body>
+</html>
