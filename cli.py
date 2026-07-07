@@ -4,7 +4,23 @@ cli.py — the installable entry point.
 
 Usage:
     python cli.py                  interactive chat loop (real conversation memory)
-    python cli.py "fix the bug in auth.py"     one-shot task (no follow-up context needed)
+    python cli.py "fix the bug in auth.py"     one-shot task
+    python cli.py --plan "refactor the auth module"   plan mode: pauses for your
+                                                       approval before any write/edit/bash
+
+    # Unix piping:
+    echo "fix the bug in auth.py" | python cli.py
+    cat bug_report.txt | python cli.py "summarize and fix"
+    cat bug_report.txt | python cli.py         # piped content alone becomes the task
+    cat bug_report.txt | python cli.py --plan  # piped task, plan mode on
+
+Diff-before-apply: whenever the agent stages changes with stage_write_file /
+stage_edit_file and then calls apply_pending_changes, you'll see the full
+diff here and be asked to approve, reject, or leave feedback before anything
+is written to disk.
+
+Project memory: if an AGENT.md (or CLAUDE.md) file exists in the current
+directory, it is auto-loaded and given to the agent as project context.
 
 Setup: set your API keys as environment variables (or Replit Secrets):
     CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, ... CEREBRAS_API_KEY_9
@@ -35,7 +51,12 @@ def _print_step(step):
                         print(f"   {marker.get(item.get('status'), '☐')} {item.get('content', '')}")
                     continue
                 except (json.JSONDecodeError, AttributeError):
-                    pass  # fall through to generic rendering below
+                    pass
+
+            if name in ("submit_plan", "apply_pending_changes"):
+                # Rendered separately/interactively by the approval prompts;
+                # skip here to avoid printing raw JSON twice.
+                continue
 
             print(f"   🔧 {name}({args})")
 
@@ -48,18 +69,90 @@ def _ask_confirmation(command):
     return answer == "y"
 
 
-def main():
-    print("=== Coding Agent CLI ===")
-    print("Type your task, or 'quit' to exit.")
-    print("Prefix a task with 'plan: ' to investigate and propose a plan first, without changing anything.\n")
+def _ask_plan_approval(plan_text):
+    """
+    Shown when the agent calls submit_plan in plan mode.
+    Returns (approved: bool, feedback: str).
+    """
+    print("\n📝 Proposed plan:")
+    print("   " + "\n   ".join(plan_text.strip().splitlines()))
+    answer = input("\n   Approve this plan? [y/N/feedback] ").strip()
+    if answer.lower() == "y":
+        return True, ""
+    if answer.lower() in ("n", ""):
+        return False, "Plan rejected, no specific feedback given — please reconsider your approach."
+    # Anything else typed is treated as feedback for a revision
+    return False, answer
 
-    if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:])
-        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
+
+def _ask_diff_approval(diff_text):
+    """
+    Shown when the agent calls apply_pending_changes. Prints the full staged
+    diff across every file and asks for approval before anything is written.
+    Returns (approved: bool, feedback: str).
+    """
+    print("\n📄 Pending changes (nothing written to disk yet):\n")
+    print(diff_text)
+    answer = input("\n   Apply these changes? [y/N/feedback] ").strip()
+    if answer.lower() == "y":
+        return True, ""
+    if answer.lower() in ("n", ""):
+        return False, "Changes rejected, no specific feedback given."
+    return False, answer
+
+
+def _read_stdin_if_piped():
+    """Return piped stdin content, or None if stdin is a real terminal (no pipe)."""
+    if sys.stdin.isatty():
+        return None
+    data = sys.stdin.read().strip()
+    return data or None
+
+
+def _parse_args(argv):
+    """Extract --plan flag and remaining task words from CLI args."""
+    plan_mode = False
+    task_words = []
+    for arg in argv:
+        if arg == "--plan":
+            plan_mode = True
+        else:
+            task_words.append(arg)
+    return plan_mode, " ".join(task_words)
+
+
+def main():
+    plan_mode, cli_task = _parse_args(sys.argv[1:])
+    piped_input = _read_stdin_if_piped()
+
+    shared_kwargs = {"diff_confirm_callback": _ask_diff_approval}
+    if plan_mode:
+        shared_kwargs["plan_mode"] = True
+        shared_kwargs["plan_confirm_callback"] = _ask_plan_approval
+
+    # Case 1: CLI arg task, possibly combined with piped context
+    if cli_task:
+        task = cli_task
+        if piped_input:
+            task = f"{task}\n\n---\n{piped_input}"
+        if plan_mode:
+            print("=== Coding Agent CLI (plan mode) ===")
+        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
         print(f"\n✅ {result}")
         return
 
-    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
+    # Case 2: no CLI arg, but stdin was piped — piped content IS the task
+    if piped_input:
+        print(f"=== Coding Agent CLI (piped input{', plan mode' if plan_mode else ''}) ===")
+        result = run_agent(piped_input, on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
+        print(f"\n✅ {result}")
+        return
+
+    # Case 3: normal interactive mode
+    print("=== Coding Agent CLI ===" + (" (plan mode)" if plan_mode else ""))
+    print("Type your task, or 'quit' to exit.\n")
+
+    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
 
     while True:
         try:
@@ -73,25 +166,9 @@ def main():
             print("bye")
             break
         if task.lower() == "new":
-            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
+            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
             print("(started a fresh conversation)")
             continue
-
-        if task.lower().startswith("plan:"):
-            real_task = task[len("plan:"):].strip()
-            print("\n🔒 Plan mode — investigating only, nothing will be changed yet.")
-            plan_result = run_agent(
-                real_task, on_step=_print_step, use_memory=False, plan_mode=True
-            )
-            print(f"\n📋 {plan_result}")
-            approve = input("\nExecute this now with full tools? [y/N] ").strip().lower()
-            if approve == "y":
-                result = conversation.send(real_task)
-                print(f"\n✅ {result}")
-            else:
-                print("(not executed)")
-            continue
-
         result = conversation.send(task)
         print(f"\n✅ {result}")
 

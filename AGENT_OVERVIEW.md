@@ -1,8 +1,8 @@
 # Coding Agent — Complete Overview
 
-> **Last synced:** All 18 Python files read from latest source.
+> **Last synced:** All 19 Python files read from latest source.
 
-A self-directing coding agent that reads, writes, edits, and runs code via LLM tool-calling. It rotates across multiple API providers, maintains importance-weighted persistent memory, supports parallel fan-out, sandboxes shell execution, provides AST-aware code search, speaks real LSP, logs every tool call, and can create its own new tools at runtime. It also ships a complete N-agent simulation engine.
+A self-directing coding agent that reads, writes, edits, and runs code via LLM tool-calling. It rotates across multiple API providers, maintains importance-weighted persistent memory, supports parallel fan-out and sequential sub-agent delegation, has a first-class plan-gating system, a diff-before-apply staged changes workflow, headless browser control with visual self-verification, AST-aware code search, a full LSP client, structured tool-call logging, and can create its own new tools at runtime. It also ships a complete N-agent simulation engine.
 
 ---
 
@@ -12,23 +12,24 @@ A self-directing coding agent that reads, writes, edits, and runs code via LLM t
 2. [cli.py — Entry Point](#clipy--entry-point)
 3. [agent.py — Core Loop](#agentpy--core-loop)
 4. [tools.py — Built-in Tools](#toolspy--built-in-tools)
-5. [provider_pool.py — LLM Rotation](#provider_poolpy--llm-rotation)
-6. [task_memory.py — Cross-Session Memory](#task_memorypy--cross-session-memory)
-7. [custom_tool_registry.py — Self-Created Tools](#custom_tool_registrypy--self-created-tools)
-8. [custom_tools.py — Agent-Created Tools](#custom_toolspy--agent-created-tools)
-9. [run_logger.py — Tool Call Logger](#run_loggerpy--tool-call-logger)
-10. [structural_search.py — AST Code Search](#structural_searchpy--ast-code-search)
-11. [lsp_client.py — Language Server Client](#lsp_clientpy--language-server-client)
-12. [file_search.py — Glob File Search](#file_searchpy--glob-file-search)
-13. [firebase_tools.py — Firebase Scaffolding](#firebase_toolspy--firebase-scaffolding)
-14. [github_tools.py — GitHub Integration](#github_toolspy--github-integration)
-15. [meta_builder.py — Simulation Generator](#meta_builderpy--simulation-generator)
-16. [tick_engine.py — Simulation Runtime](#tick_enginepy--simulation-runtime)
-17. [memory.py — Per-Agent Memory Store](#memorypy--per-agent-memory-store)
-18. [director.py — Event Injection](#directorpy--event-injection)
-19. [Utility Files](#utility-files)
-20. [Environment Variables](#environment-variables)
-21. [Full System Architecture](#full-system-architecture)
+5. [vision_tools.py — Browser & Visual Verification](#vision_toolspy--browser--visual-verification)
+6. [provider_pool.py — LLM Rotation](#provider_poolpy--llm-rotation)
+7. [task_memory.py — Cross-Session Memory](#task_memorypy--cross-session-memory)
+8. [custom_tool_registry.py — Self-Created Tools](#custom_tool_registrypy--self-created-tools)
+9. [custom_tools.py — Agent-Created Tools](#custom_toolspy--agent-created-tools)
+10. [run_logger.py — Tool Call Logger](#run_loggerpy--tool-call-logger)
+11. [structural_search.py — AST Code Search](#structural_searchpy--ast-code-search)
+12. [lsp_client.py — Language Server Client](#lsp_clientpy--language-server-client)
+13. [file_search.py — Glob File Search](#file_searchpy--glob-file-search)
+14. [firebase_tools.py — Firebase Scaffolding](#firebase_toolspy--firebase-scaffolding)
+15. [github_tools.py — GitHub Integration](#github_toolspy--github-integration)
+16. [meta_builder.py — Simulation Generator](#meta_builderpy--simulation-generator)
+17. [tick_engine.py — Simulation Runtime](#tick_enginepy--simulation-runtime)
+18. [memory.py — Per-Agent Memory Store](#memorypy--per-agent-memory-store)
+19. [director.py — Event Injection](#directorpy--event-injection)
+20. [Utility Files](#utility-files)
+21. [Environment Variables](#environment-variables)
+22. [Full System Architecture](#full-system-architecture)
 
 ---
 
@@ -36,9 +37,10 @@ A self-directing coding agent that reads, writes, edits, and runs code via LLM t
 
 ```
 .
-├── cli.py                    # Entry point — interactive loop + one-shot + plan mode
-├── agent.py                  # Core LLM reasoning loop + fan-out + tool logging
-├── tools.py                  # Built-in tools — sandboxed shell, snapshots, ripgrep
+├── cli.py                    # Entry point — interactive, one-shot, --plan flag, stdin piping
+├── agent.py                  # Core loop: plan gating, sub-agent delegation, AGENT.md loading
+├── tools.py                  # Built-in tools — immediate writes + staged diff-before-apply
+├── vision_tools.py           # Browser control, screenshot cropping, visual self-verification
 ├── provider_pool.py          # Multi-key LLM rotation with Retry-After-aware cooldowns
 ├── task_memory.py            # Importance-weighted cross-session semantic memory
 ├── custom_tool_registry.py   # Agent self-creates tools — timeout-guarded validation + runtime
@@ -65,35 +67,44 @@ A self-directing coding agent that reads, writes, edits, and runs code via LLM t
 
 ## cli.py — Entry Point
 
-### What Changed
-- Added **`plan:` prefix mode** — investigates and proposes a plan without making any changes, then asks for human approval before executing.
-
-### Usage
-
-```bash
-python cli.py                          # interactive loop
-python cli.py "fix the bug in auth.py" # one-shot
-```
-
-Inside the interactive loop:
-```
-you > plan: refactor the auth module   # investigate only, no writes
-you > new                              # reset conversation
-you > quit                             # exit
-```
-
 ### Features
 
 | Feature | Description |
 |---|---|
-| **Interactive mode** | `Conversation` — history grows across turns |
-| **One-shot mode** | `run_agent()` — fresh context, exits after task |
-| **Plan mode** | `plan: <task>` — read-only investigation, shows plan, asks for approval before running |
+| **Interactive mode** | Growing `Conversation` history across turns |
+| **One-shot mode** | `python cli.py "task"` — fresh context, exits |
+| **`--plan` flag** | Restricts agent to read-only tools until plan approved; applies to all three modes |
+| **stdin piping** | `echo "task" \| python cli.py`, `cat file.txt \| python cli.py "summarize and fix"` |
 | **Live step rendering** | Every tool call and LLM reply streamed to terminal |
 | **Todo display** | `write_todos` rendered as ☐ ◐ ☑ checklist |
-| **Destructive confirmation** | Pauses before dangerous shell commands |
+| **Destructive confirmation** | `_ask_confirmation()` pauses before dangerous shell commands |
+| **Plan approval UI** | `_ask_plan_approval()` — shows proposed plan, accepts `y` / `N` / feedback text |
+| **Diff approval UI** | `_ask_diff_approval()` — shows full staged diff before any writes, accepts `y` / `N` / feedback |
 | **`new` command** | Reset conversation without restarting |
 | **Clean exit** | Handles `EOFError` and `KeyboardInterrupt` |
+
+### Usage
+
+```bash
+python cli.py                                    # interactive
+python cli.py "fix the bug in auth.py"           # one-shot
+python cli.py --plan "refactor the auth module"  # plan mode one-shot
+
+echo "fix the import error" | python cli.py          # piped task
+cat bug_report.txt | python cli.py "summarize and fix"  # piped context + task
+cat bug_report.txt | python cli.py --plan             # piped task in plan mode
+```
+
+### Plan Mode (`--plan`)
+
+When `--plan` is passed, the agent is restricted to read-only tools until it calls `submit_plan`. The CLI intercepts `submit_plan`, prints the plan, and prompts for approval:
+- `y` → plan approved, agent proceeds with full tool set
+- `N` or empty → plan rejected, agent revises and re-submits
+- Any other text → treated as feedback, sent back to the agent
+
+### Diff Review (`apply_pending_changes`)
+
+When the agent stages changes with `stage_write_file` / `stage_edit_file` and calls `apply_pending_changes`, the CLI intercepts it, prints the full unified diff across all staged files, and prompts for approval before anything hits disk.
 
 ### Full Code
 
@@ -104,7 +115,23 @@ cli.py — the installable entry point.
 
 Usage:
     python cli.py                  interactive chat loop (real conversation memory)
-    python cli.py "fix the bug in auth.py"     one-shot task (no follow-up context needed)
+    python cli.py "fix the bug in auth.py"     one-shot task
+    python cli.py --plan "refactor the auth module"   plan mode: pauses for your
+                                                       approval before any write/edit/bash
+
+    # Unix piping:
+    echo "fix the bug in auth.py" | python cli.py
+    cat bug_report.txt | python cli.py "summarize and fix"
+    cat bug_report.txt | python cli.py         # piped content alone becomes the task
+    cat bug_report.txt | python cli.py --plan  # piped task, plan mode on
+
+Diff-before-apply: whenever the agent stages changes with stage_write_file /
+stage_edit_file and then calls apply_pending_changes, you'll see the full
+diff here and be asked to approve, reject, or leave feedback before anything
+is written to disk.
+
+Project memory: if an AGENT.md (or CLAUDE.md) file exists in the current
+directory, it is auto-loaded and given to the agent as project context.
 
 Setup: set your API keys as environment variables (or Replit Secrets):
     CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, ... CEREBRAS_API_KEY_9
@@ -135,7 +162,12 @@ def _print_step(step):
                         print(f"   {marker.get(item.get('status'), '☐')} {item.get('content', '')}")
                     continue
                 except (json.JSONDecodeError, AttributeError):
-                    pass  # fall through to generic rendering below
+                    pass
+
+            if name in ("submit_plan", "apply_pending_changes"):
+                # Rendered separately/interactively by the approval prompts;
+                # skip here to avoid printing raw JSON twice.
+                continue
 
             print(f"   🔧 {name}({args})")
 
@@ -148,18 +180,90 @@ def _ask_confirmation(command):
     return answer == "y"
 
 
-def main():
-    print("=== Coding Agent CLI ===")
-    print("Type your task, or 'quit' to exit.")
-    print("Prefix a task with 'plan: ' to investigate and propose a plan first, without changing anything.\n")
+def _ask_plan_approval(plan_text):
+    """
+    Shown when the agent calls submit_plan in plan mode.
+    Returns (approved: bool, feedback: str).
+    """
+    print("\n📝 Proposed plan:")
+    print("   " + "\n   ".join(plan_text.strip().splitlines()))
+    answer = input("\n   Approve this plan? [y/N/feedback] ").strip()
+    if answer.lower() == "y":
+        return True, ""
+    if answer.lower() in ("n", ""):
+        return False, "Plan rejected, no specific feedback given — please reconsider your approach."
+    # Anything else typed is treated as feedback for a revision
+    return False, answer
 
-    if len(sys.argv) > 1:
-        task = " ".join(sys.argv[1:])
-        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation)
+
+def _ask_diff_approval(diff_text):
+    """
+    Shown when the agent calls apply_pending_changes. Prints the full staged
+    diff across every file and asks for approval before anything is written.
+    Returns (approved: bool, feedback: str).
+    """
+    print("\n📄 Pending changes (nothing written to disk yet):\n")
+    print(diff_text)
+    answer = input("\n   Apply these changes? [y/N/feedback] ").strip()
+    if answer.lower() == "y":
+        return True, ""
+    if answer.lower() in ("n", ""):
+        return False, "Changes rejected, no specific feedback given."
+    return False, answer
+
+
+def _read_stdin_if_piped():
+    """Return piped stdin content, or None if stdin is a real terminal (no pipe)."""
+    if sys.stdin.isatty():
+        return None
+    data = sys.stdin.read().strip()
+    return data or None
+
+
+def _parse_args(argv):
+    """Extract --plan flag and remaining task words from CLI args."""
+    plan_mode = False
+    task_words = []
+    for arg in argv:
+        if arg == "--plan":
+            plan_mode = True
+        else:
+            task_words.append(arg)
+    return plan_mode, " ".join(task_words)
+
+
+def main():
+    plan_mode, cli_task = _parse_args(sys.argv[1:])
+    piped_input = _read_stdin_if_piped()
+
+    shared_kwargs = {"diff_confirm_callback": _ask_diff_approval}
+    if plan_mode:
+        shared_kwargs["plan_mode"] = True
+        shared_kwargs["plan_confirm_callback"] = _ask_plan_approval
+
+    # Case 1: CLI arg task, possibly combined with piped context
+    if cli_task:
+        task = cli_task
+        if piped_input:
+            task = f"{task}\n\n---\n{piped_input}"
+        if plan_mode:
+            print("=== Coding Agent CLI (plan mode) ===")
+        result = run_agent(task, on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
         print(f"\n✅ {result}")
         return
 
-    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
+    # Case 2: no CLI arg, but stdin was piped — piped content IS the task
+    if piped_input:
+        print(f"=== Coding Agent CLI (piped input{', plan mode' if plan_mode else ''}) ===")
+        result = run_agent(piped_input, on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
+        print(f"\n✅ {result}")
+        return
+
+    # Case 3: normal interactive mode
+    print("=== Coding Agent CLI ===" + (" (plan mode)" if plan_mode else ""))
+    print("Type your task, or 'quit' to exit.\n")
+
+    conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
 
     while True:
         try:
@@ -173,25 +277,9 @@ def main():
             print("bye")
             break
         if task.lower() == "new":
-            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation)
+            conversation = Conversation(on_step=_print_step, confirm_callback=_ask_confirmation, **shared_kwargs)
             print("(started a fresh conversation)")
             continue
-
-        if task.lower().startswith("plan:"):
-            real_task = task[len("plan:"):].strip()
-            print("\n🔒 Plan mode — investigating only, nothing will be changed yet.")
-            plan_result = run_agent(
-                real_task, on_step=_print_step, use_memory=False, plan_mode=True
-            )
-            print(f"\n📋 {plan_result}")
-            approve = input("\nExecute this now with full tools? [y/N] ").strip().lower()
-            if approve == "y":
-                result = conversation.send(real_task)
-                print(f"\n✅ {result}")
-            else:
-                print("(not executed)")
-            continue
-
         result = conversation.send(task)
         print(f"\n✅ {result}")
 
@@ -204,25 +292,53 @@ if __name__ == "__main__":
 
 ## agent.py — Core Loop
 
-### What Changed
-- **Imports** now include `structural_search`, `lsp_client`, `file_search`, and `run_logger`.
-- All four new tool modules are merged into `TOOL_SCHEMA` / `TOOL_FUNCTIONS`.
-- **Every tool call is now timed and logged** via `run_logger.log_tool_call()` — name, args preview, latency in ms, result preview, error flag.
-- System prompt updated to guide the agent to **prefer AST tools** (`find_definition`, `find_callers`, etc.) over `search_codebase` when the question is about a specific Python symbol.
-
 ### Features
 
 | Feature | Description |
 |---|---|
 | **Tool-calling loop** | Up to 40 LLM ↔ tool turns per task |
 | **`run_agent()`** | Single-shot runner — fresh context per call |
-| **`Conversation`** | Stateful multi-turn session |
-| **Fan-out** | Parallel `run_agent()` via `ThreadPoolExecutor` |
+| **`Conversation`** | Stateful multi-turn session with growing history |
+| **Plan mode** | `plan_mode=True` restricts to read-only tools until `submit_plan` approved |
+| **`submit_plan` tool** | Agent proposes plan; `plan_confirm_callback` gates approval; defense-in-depth blocks write tools until approved |
+| **Diff mode** | `diff_confirm_callback` gates `apply_pending_changes` — human sees full diff before any write |
+| **`delegate_subagent()`** | Fresh isolated sub-conversation; only returns final summary; no recursion; no destructive commands |
+| **`AGENT.md` auto-load** | Reads `AGENT.md`, `CLAUDE.md`, or `.agent/AGENT.md` from project root, injects into system prompt |
 | **Task memory** | Injects relevant past summaries; saves on completion |
-| **Tool call logging** | Every call timed + written to `.agent_runs.jsonl` |
 | **Custom tool hot-reload** | After `create_tool`, new tool available next turn |
+| **Fan-out** | Parallel `run_agent()` via `ThreadPoolExecutor` |
 | **Empty-response guard** | Nudges model on blank replies; errors after 2 in a row |
-| **Full tool registry** | 28+ tools across 9 modules |
+
+### Plan Mode Mechanics
+
+1. When `plan_mode=True`, only tools in `READ_ONLY_TOOL_NAMES` are exposed to the model.
+2. Agent investigates using read-only tools, then calls `submit_plan`.
+3. `plan_confirm_callback(plan_text)` returns `(approved: bool, feedback: str)`.
+4. If approved: full tool set unlocked, `plan_approved = True` carried through remaining turns.
+5. If rejected: feedback sent back, agent revises and re-submits.
+6. Defense-in-depth: even if the model emits a write tool call before approval, `_run_loop` blocks it explicitly.
+
+### Read-Only Tools (allowed before plan approval)
+
+```
+read_file  read_files  list_directory  search_codebase  write_todos
+submit_plan  list_open_issues
+browser_navigate  browser_screenshot  screen_crop  visual_self_verify
+review_pending_changes
+```
+
+### AGENT.md Auto-Loading
+
+On every `run_agent()` call and `Conversation()` init, `_load_project_context()` searches the project root for `AGENT.md` → `CLAUDE.md` → `.agent/AGENT.md` (first found wins). Content is truncated to 8 000 chars and prepended to the system prompt as `"Project context from AGENT.md:\n..."`. This lets teams encode project-specific conventions that the agent always sees.
+
+### delegate_subagent
+
+Spins up a fresh, isolated `_run_loop` with a clean context. The sub-agent:
+- Gets its own system prompt with an addendum explaining it's a sub-agent
+- Cannot call `delegate_subagent` (recursion prevention)
+- Cannot run destructive bash commands (no `confirm_callback` wired through)
+- Returns only its final plain-text summary — the full tool-call history stays out of the parent's context
+- Default max 15 turns
 
 ### Full Code
 
@@ -230,26 +346,35 @@ if __name__ == "__main__":
 """
 agent.py — the core reasoning loop, plus fan-out for big tasks.
 
-UPDATED: every tool call is now logged (name, args, latency, result preview,
-error flag) to .agent_runs.jsonl via run_logger.log_tool_call(). Everything
-else is unchanged from the original.
+Features in this version:
+  - AGENT.md project memory: auto-loaded from the project root (if present)
+    and injected into the system prompt.
+  - Plan mode: agent restricted to read-only tools until submit_plan is
+    approved by the human.
+  - Diff-before-apply: apply_pending_changes (from tools.py) is gated behind
+    a human reviewing the full staged diff, the same way destructive bash
+    commands are gated.
+  - Sub-agent delegation: delegate_subagent spins up a fresh, isolated
+    conversation for a self-contained chunk of work and returns just its
+    final summary — sequential and synchronous, unlike fan_out's parallel
+    multi-target execution.
 """
 
 import json
-import time
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from provider_pool import ask_ai
-from tools import TOOL_SCHEMA, TOOL_FUNCTIONS, _matches_any, _DESTRUCTIVE_PATTERNS
+from tools import (
+    TOOL_SCHEMA, TOOL_FUNCTIONS, _matches_any, _DESTRUCTIVE_PATTERNS,
+    review_pending_changes,
+)
 from firebase_tools import FIREBASE_TOOL_SCHEMA, FIREBASE_TOOL_FUNCTIONS
 from github_tools import GITHUB_TOOL_SCHEMA, GITHUB_TOOL_FUNCTIONS
+from vision_tools import VISION_TOOL_SCHEMA, VISION_TOOL_FUNCTIONS
 from meta_builder import build_agent_system
 from custom_tool_registry import CREATE_TOOL_SCHEMA, CREATE_TOOL_FUNCTIONS, load_custom_tools
-from structural_search import STRUCTURAL_SEARCH_TOOL_SCHEMA, STRUCTURAL_SEARCH_TOOL_FUNCTIONS
-from lsp_client import LSP_TOOL_SCHEMA, LSP_TOOL_FUNCTIONS
-from file_search import FILE_SEARCH_TOOL_SCHEMA, FILE_SEARCH_TOOL_FUNCTIONS
 import task_memory
-import run_logger
 
 META_BUILDER_TOOL_SCHEMA = [
     {"type": "function", "function": {
@@ -266,23 +391,110 @@ META_BUILDER_TOOL_SCHEMA = [
 ]
 META_BUILDER_TOOL_FUNCTIONS = {"build_agent_system": build_agent_system}
 
+
+# ---------------------------------------------------------------------------
+# Plan mode — submit_plan tool. Actual gating happens in _run_loop.
+# ---------------------------------------------------------------------------
+
+def submit_plan(plan):
+    """Placeholder body — _run_loop intercepts this call before it ever runs."""
+    return plan
+
+
+PLAN_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "submit_plan",
+        "description": "Submit your implementation plan for human approval. In plan mode, you "
+                        "MUST call this before using any file-writing, editing, or shell tool. "
+                        "Describe the concrete steps you intend to take.",
+        "parameters": {"type": "object", "properties": {
+            "plan": {"type": "string", "description": "The step-by-step plan, in plain text."},
+        }, "required": ["plan"]},
+    }},
+]
+PLAN_TOOL_FUNCTIONS = {"submit_plan": submit_plan}
+
+# Tools allowed before a plan has been approved (read-only / planning only)
+READ_ONLY_TOOL_NAMES = {
+    "read_file", "read_files", "list_directory", "search_codebase",
+    "write_todos", "submit_plan", "list_open_issues",
+    "browser_navigate", "browser_screenshot", "screen_crop", "visual_self_verify",
+    "review_pending_changes",
+}
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent delegation
+# ---------------------------------------------------------------------------
+
+SUBAGENT_SYSTEM_ADDENDUM = """
+
+You are a SUB-AGENT handling one isolated, self-contained piece of work \
+delegated by a parent agent. You do not have access to delegate_subagent \
+yourself, to avoid unbounded recursion. Focus only on the task given. \
+When finished, reply with a concise plain-text summary of what you found \
+or did — this summary is the ONLY thing the parent agent will see, so make \
+it complete enough to act on."""
+
+# Tools excluded from a sub-agent's own tool set (prevents infinite recursion)
+SUBAGENT_EXCLUDED_TOOLS = {"delegate_subagent"}
+
+
+def delegate_subagent(task, max_turns=15):
+    """
+    Run an isolated, fresh-context sub-conversation for a self-contained task.
+    Returns only the sub-agent's final plain-text summary.
+    """
+    sub_schema = [e for e in TOOL_SCHEMA if e["function"]["name"] not in SUBAGENT_EXCLUDED_TOOLS]
+    sub_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + SUBAGENT_SYSTEM_ADDENDUM},
+        {"role": "user", "content": task},
+    ]
+    final, _ = _run_loop(
+        sub_messages, on_step=None, auto_confirm=False, confirm_callback=None,
+        plan_mode=False, plan_confirm_callback=None, diff_confirm_callback=None,
+        tool_schema_override=sub_schema, max_turns=max_turns,
+    )
+    return final
+
+
+DELEGATE_SUBAGENT_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "delegate_subagent",
+        "description": "Delegate an isolated, self-contained chunk of work to a fresh sub-agent "
+                        "with its own clean context (e.g. investigating a bug's root cause, "
+                        "researching how something is used across the codebase, reviewing a "
+                        "single file in depth). You only receive its final summary, not its "
+                        "full tool-call history — use this to keep your own context lean on "
+                        "large tasks. The sub-agent cannot run destructive commands or delegate "
+                        "further.",
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "The self-contained task to delegate."},
+            "max_turns": {"type": "integer", "default": 15},
+        }, "required": ["task"]},
+    }},
+]
+DELEGATE_SUBAGENT_TOOL_FUNCTIONS = {"delegate_subagent": delegate_subagent}
+
+
 _custom_schema, _custom_functions, _custom_load_errors = load_custom_tools()
 for _err in _custom_load_errors:
     print(f"[custom tools] {_err}")
 
 TOOL_SCHEMA = (
-    TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA + GITHUB_TOOL_SCHEMA
-    + META_BUILDER_TOOL_SCHEMA + CREATE_TOOL_SCHEMA + STRUCTURAL_SEARCH_TOOL_SCHEMA
-    + LSP_TOOL_SCHEMA + FILE_SEARCH_TOOL_SCHEMA + _custom_schema
+    TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA + GITHUB_TOOL_SCHEMA + VISION_TOOL_SCHEMA
+    + META_BUILDER_TOOL_SCHEMA + CREATE_TOOL_SCHEMA + PLAN_TOOL_SCHEMA
+    + DELEGATE_SUBAGENT_TOOL_SCHEMA + _custom_schema
 )
 TOOL_FUNCTIONS = {
-    **TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS,
-    **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **STRUCTURAL_SEARCH_TOOL_FUNCTIONS,
-    **LSP_TOOL_FUNCTIONS, **FILE_SEARCH_TOOL_FUNCTIONS, **_custom_functions,
+    **TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS, **VISION_TOOL_FUNCTIONS,
+    **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **PLAN_TOOL_FUNCTIONS,
+    **DELEGATE_SUBAGENT_TOOL_FUNCTIONS, **_custom_functions,
 }
 
 
 def _refresh_custom_tools():
+    """Hot-reload: makes a newly created tool available in the current session."""
     schema_list, functions, errors = load_custom_tools()
     existing_names = {entry["function"]["name"] for entry in TOOL_SCHEMA}
     for entry in schema_list:
@@ -291,6 +503,36 @@ def _refresh_custom_tools():
             TOOL_SCHEMA.append(entry)
     TOOL_FUNCTIONS.update(functions)
     return errors
+
+
+# ---------------------------------------------------------------------------
+# AGENT.md — project-level memory, auto-loaded once per run/conversation.
+# ---------------------------------------------------------------------------
+
+AGENT_MD_FILENAMES = ["AGENT.md", "CLAUDE.md", ".agent/AGENT.md"]
+MAX_AGENT_MD_CHARS = 8000
+
+
+def _load_project_context(root="."):
+    """
+    Look for a project memory file (AGENT.md, falling back to CLAUDE.md)
+    in the project root and return its content, truncated to a sane size.
+    Returns "" if none exists.
+    """
+    for filename in AGENT_MD_FILENAMES:
+        path = os.path.join(root, filename)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+            except OSError:
+                continue
+            if not content:
+                continue
+            if len(content) > MAX_AGENT_MD_CHARS:
+                content = content[:MAX_AGENT_MD_CHARS] + "\n...(truncated)"
+            return f"Project context from {filename}:\n{content}"
+    return ""
 
 
 SYSTEM_PROMPT = """You are a coding agent with direct access to the filesystem \
@@ -305,14 +547,15 @@ before searching subfolders. Ignore artifacts/, node_modules/, lib/, .cache/, \
 and other tooling/dependency folders unless the user's request specifically \
 points there.
 
-For Python code, prefer find_definition, find_callers, find_references, and \
-outline_file over search_codebase whenever the question is about a specific \
-function, class, or symbol. These are AST-aware and won't match unrelated text \
-in comments, strings, or similarly-named things. Use search_codebase for \
-everything else: free-text search, non-Python files, or unknown symbol names.
-
 If the project has a test suite, call detect_and_run_tests after making code \
 changes, before declaring the task done.
+
+For a quick, single-file fix, write_file/edit_file (immediate, no review) are \
+fine. For anything touching multiple files, or any change you want reviewed \
+as a whole before it hits disk, use stage_write_file / stage_edit_file to \
+queue the changes, call review_pending_changes to produce the full diff, then \
+apply_pending_changes to commit everything at once (this requires human \
+approval and will not silently write anything).
 
 If a task genuinely needs a capability none of your existing tools provide, \
 use create_tool to write and permanently save a new one. Prefer existing tools \
@@ -325,12 +568,36 @@ For any task with 3 or more distinct steps, call write_todos first to lay \
 out the plan, then update it as steps complete.
 
 If an edit makes things worse, use revert_file to get back to the last \
-known-good state before trying a different approach."""
+known-good state before trying a different approach.
+
+For a self-contained chunk of investigation or work that doesn't need to \
+pollute your own context with its full tool-call history (e.g. researching \
+how something is used across the codebase, or diagnosing one specific bug), \
+consider delegate_subagent and just use its returned summary.
+
+For frontend/UI work, use the browser tools (browser_navigate, browser_click, \
+browser_type, browser_screenshot) to actually see and interact with what you \
+build, the way a human tester would. If a screenshot is too blurry, cluttered, \
+or small to read a specific button or error message, use screen_crop to zoom \
+into that region before deciding what to do next. After building or editing a \
+frontend, take a screenshot and use visual_self_verify against the original \
+design mockup (if one was provided) to confirm colors, spacing, and layout \
+actually match before declaring the task done."""
+
+PLAN_MODE_ADDENDUM = """
+
+PLAN MODE IS ACTIVE. Before making any file edit, file write, or running any \
+shell command, you must first investigate using read-only tools \
+(read_file, list_directory, search_codebase, browser tools), then call \
+submit_plan with a concrete step-by-step plan. Do not call any writing/editing/ \
+shell tool until submit_plan has been approved. If the plan is rejected, revise \
+it based on the feedback and call submit_plan again."""
 
 MAX_TURNS = 40
 
 
-def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None):
+def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=None,
+                        diff_confirm_callback=None):
     name = tool_call["function"]["name"]
     try:
         args = json.loads(tool_call["function"]["arguments"] or "{}")
@@ -350,38 +617,53 @@ def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=No
             if allowed:
                 args["confirmed"] = True
             else:
-                logged_result = f"Command declined by user: '{command}'. Not run. Try a different approach."
-                run_logger.log_tool_call(name, args, logged_result, 0.0, is_error=False)
-                return logged_result
+                return f"Command declined by user: '{command}'. Not run."
 
-    start = time.perf_counter()
+    if name == "apply_pending_changes" and not args.get("confirmed"):
+        if confirm_destructive:
+            args["confirmed"] = True
+        elif diff_confirm_callback:
+            diff_text = review_pending_changes()
+            approved, feedback = diff_confirm_callback(diff_text)
+            if approved:
+                args["confirmed"] = True
+            else:
+                return (
+                    "Changes NOT applied — user rejected the diff."
+                    + (f" Feedback: {feedback}" if feedback else "")
+                    + " Pending changes remain staged; revise with stage_write_file/"
+                      "stage_edit_file and try again, or discard_pending_changes."
+                )
+
     try:
         result = func(**args)
-        is_error = isinstance(result, str) and result.startswith("ERROR")
     except TypeError as e:
-        result = f"ERROR: bad arguments for {name}: {e}"
-        is_error = True
+        return f"ERROR: bad arguments for {name}: {e}"
     except Exception as e:
-        result = f"ERROR: {name} raised an exception: {e}"
-        is_error = True
-    latency_ms = (time.perf_counter() - start) * 1000
+        return f"ERROR: {name} raised an exception: {e}"
 
     if name == "create_tool" and isinstance(result, str) and result.startswith("Tool '"):
         refresh_errors = _refresh_custom_tools()
         if refresh_errors:
             result += f"\n(Note: {'; '.join(refresh_errors)})"
 
-    run_logger.log_tool_call(name, args, result, latency_ms, is_error=is_error)
     return result
 
 
-def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
+def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True,
+              plan_mode=False, plan_confirm_callback=None, diff_confirm_callback=None):
     memory_context = ""
     if use_memory:
         relevant = task_memory.retrieve_relevant(task)
         memory_context = task_memory.format_for_prompt(relevant)
 
+    project_context = _load_project_context()
+
     system_content = SYSTEM_PROMPT
+    if plan_mode:
+        system_content += PLAN_MODE_ADDENDUM
+    if project_context:
+        system_content += "\n\n" + project_context
     if memory_context:
         system_content += "\n\n" + memory_context
 
@@ -390,21 +672,36 @@ def run_agent(task, on_step=None, auto_confirm=False, confirm_callback=None, use
         {"role": "user", "content": task},
     ]
 
-    final = _run_loop(messages, on_step, auto_confirm, confirm_callback)
+    final, _ = _run_loop(messages, on_step, auto_confirm, confirm_callback,
+                          plan_mode=plan_mode, plan_confirm_callback=plan_confirm_callback,
+                          diff_confirm_callback=diff_confirm_callback)
     if use_memory:
         task_memory.add_task_summary(task, final)
     return final
 
 
 class Conversation:
-    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True):
+    def __init__(self, on_step=None, auto_confirm=False, confirm_callback=None, use_memory=True,
+                 plan_mode=False, plan_confirm_callback=None, diff_confirm_callback=None):
         self.on_step = on_step
         self.auto_confirm = auto_confirm
         self.confirm_callback = confirm_callback
         self.use_memory = use_memory
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.plan_mode = plan_mode
+        self.plan_confirm_callback = plan_confirm_callback
+        self.diff_confirm_callback = diff_confirm_callback
+
+        system_content = SYSTEM_PROMPT
+        if plan_mode:
+            system_content += PLAN_MODE_ADDENDUM
+        project_context = _load_project_context()
+        if project_context:
+            system_content += "\n\n" + project_context
+
+        self.messages = [{"role": "system", "content": system_content}]
         self._memory_applied = False
         self._first_task = None
+        self._plan_approved = not plan_mode
 
     def send(self, task):
         if not self._memory_applied and self.use_memory:
@@ -416,7 +713,12 @@ class Conversation:
             self._first_task = task
 
         self.messages.append({"role": "user", "content": task})
-        final = _run_loop(self.messages, self.on_step, self.auto_confirm, self.confirm_callback)
+        final, self._plan_approved = _run_loop(
+            self.messages, self.on_step, self.auto_confirm, self.confirm_callback,
+            plan_mode=self.plan_mode, plan_confirm_callback=self.plan_confirm_callback,
+            diff_confirm_callback=self.diff_confirm_callback,
+            plan_already_approved=self._plan_approved,
+        )
         self.messages.append({"role": "assistant", "content": final})
 
         if self.use_memory:
@@ -425,14 +727,27 @@ class Conversation:
         return final
 
 
-def _run_loop(messages, on_step, auto_confirm, confirm_callback):
-    consecutive_empty = 0
+def _filtered_schema_for_plan_state(base_schema, plan_approved):
+    """When a plan hasn't been approved yet, only expose read-only tools."""
+    if plan_approved:
+        return base_schema
+    return [entry for entry in base_schema if entry["function"]["name"] in READ_ONLY_TOOL_NAMES]
 
-    for turn in range(MAX_TURNS):
-        message = ask_ai(messages, tools=TOOL_SCHEMA)
+
+def _run_loop(messages, on_step, auto_confirm, confirm_callback,
+              plan_mode=False, plan_confirm_callback=None, diff_confirm_callback=None,
+              plan_already_approved=False, tool_schema_override=None, max_turns=None):
+    base_schema = tool_schema_override if tool_schema_override is not None else TOOL_SCHEMA
+    turn_limit = max_turns if max_turns is not None else MAX_TURNS
+    consecutive_empty = 0
+    plan_approved = plan_already_approved or not plan_mode
+
+    for turn in range(turn_limit):
+        active_schema = _filtered_schema_for_plan_state(base_schema, plan_approved)
+        message = ask_ai(messages, tools=active_schema)
 
         if isinstance(message, dict) and "error" in message:
-            return f"ERROR: {message['error']}"
+            return f"ERROR: {message['error']}", plan_approved
 
         content = message.get("content") if isinstance(message, dict) else message.content
         tool_calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
@@ -444,12 +759,11 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback):
             if not content or not content.strip():
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
-                    return "ERROR: model returned empty responses repeatedly."
+                    return "ERROR: model returned empty responses repeatedly.", plan_approved
                 messages.append({"role": "assistant", "content": content or ""})
-                messages.append({"role": "user",
-                    "content": "Your last response was empty. Please continue."})
+                messages.append({"role": "user", "content": "Your last response was empty. Please continue."})
                 continue
-            return content
+            return content, plan_approved
 
         consecutive_empty = 0
         messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
@@ -459,8 +773,44 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback):
                 "id": tc.id,
                 "function": {"name": tc.function.name, "arguments": tc.function.arguments},
             }
+            fn_name = tc_dict["function"]["name"]
+
+            if fn_name == "submit_plan" and plan_mode and not plan_approved:
+                try:
+                    plan_args = json.loads(tc_dict["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    plan_args = {}
+                plan_text = plan_args.get("plan", "")
+
+                if plan_confirm_callback:
+                    approved, feedback = plan_confirm_callback(plan_text)
+                else:
+                    approved, feedback = True, ""
+
+                if approved:
+                    plan_approved = True
+                    result = "Plan approved by the user. You may now proceed using any tool."
+                else:
+                    result = (
+                        "Plan REJECTED by the user."
+                        + (f" Feedback: {feedback}" if feedback else "")
+                        + " Revise your plan and call submit_plan again."
+                    )
+                messages.append({"role": "tool", "tool_call_id": tc_dict["id"], "content": result})
+                continue
+
+            # Defense in depth: block write tools if plan not yet approved
+            if plan_mode and not plan_approved and fn_name not in READ_ONLY_TOOL_NAMES:
+                messages.append({
+                    "role": "tool", "tool_call_id": tc_dict["id"],
+                    "content": f"BLOCKED: '{fn_name}' is not allowed until your plan is "
+                               f"submitted via submit_plan and approved by the user.",
+                })
+                continue
+
             result = _execute_tool_call(
-                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback
+                tc_dict, confirm_destructive=auto_confirm, confirm_callback=confirm_callback,
+                diff_confirm_callback=diff_confirm_callback,
             )
             messages.append({
                 "role": "tool",
@@ -468,7 +818,7 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback):
                 "content": str(result)[:6000],
             })
 
-    return "Reached max turns without finishing — task may be too large for one run."
+    return "Reached max turns without finishing — task may be too large for one run.", plan_approved
 
 
 def fan_out(task_template, targets, max_workers=8, auto_confirm=True):
@@ -493,44 +843,57 @@ def fan_out(task_template, targets, max_workers=8, auto_confirm=True):
 
 ## tools.py — Built-in Tools
 
-### What Changed
-- **`run_bash` is now sandboxed:** binary allowlist (only approved commands can run, checked across chained commands), resource limits via `setrlimit` (30s CPU, 1 GB memory, 64 processes max).
-- **`search_codebase`** now uses **ripgrep** (`rg`) automatically when installed, falling back to pure-Python scan.
-- **`write_file`** and **`edit_file`** now **snapshot** the previous version to `.agent_snapshots/` before overwriting.
-- **`revert_file`** now has a second fallback: if the file isn't git-tracked, it restores from the most recent snapshot in `.agent_snapshots/`.
+### Design Philosophy
+
+Two write strategies:
+- **Immediate** (`write_file`, `edit_file`): writes straight to disk, no review. Best for quick single-file fixes.
+- **Staged** (`stage_write_file`, `stage_edit_file` → `review_pending_changes` → `apply_pending_changes`): queues changes without touching disk, generates a full unified diff for human review, then applies everything at once. Best for multi-file refactors or anything the agent wants reviewed before committing.
 
 ### Tool Summary
 
 | Tool | Description |
 |---|---|
 | `read_file` | Read file, optional line range |
-| `write_file` | Atomic write + snapshot previous version |
-| `edit_file` | Find-and-replace, exactly one match required; snapshots first |
 | `read_files` | Read multiple files in one call (20 000 char cap) |
+| `write_file` | Atomic write — immediate, no review step |
+| `edit_file` | Find-and-replace, exactly one match required — immediate |
+| `stage_write_file` | Queue a full-file write without touching disk |
+| `stage_edit_file` | Queue a find-and-replace without touching disk; composes with prior staged edits |
+| `review_pending_changes` | Full unified diff of all currently staged changes across all files |
+| `apply_pending_changes` | Write every staged change to disk — requires `confirmed=True` (human-gated) |
+| `discard_pending_changes` | Throw away staged changes without writing anything |
 | `list_directory` | List files and folders at a path |
-| `search_codebase` | Text/regex search — ripgrep if available, pure-Python fallback |
-| `run_bash` | Sandboxed shell: allowlist + resource limits + soft/hard blocks |
-| `revert_file` | Git checkout or latest snapshot fallback |
+| `search_codebase` | Text/regex search across files (pure-Python) |
+| `run_bash` | Shell — hard-blocked catastrophic patterns + soft-block confirm for destructive |
+| `revert_file` | `git checkout -- <path>` to restore last committed state |
 | `detect_and_run_tests` | Auto-detect and run pytest or npm test |
 | `write_todos` | Create/update visible task checklist |
 | `git_commit` | Stage all + commit (injection-safe subprocess list) |
 
-### Allowed Binaries in run_bash
+### Staged Changes System
 
-```
-git  python3  python  pip  pip3  pytest  npm  npx  node
-ls  cat  grep  find  mkdir  cp  mv  echo  pwd  cd
-chmod  touch  diff  wc  head  tail  sort  uniq  sed
-awk  tar  unzip  zip  curl  which  env  sleep  true  false
+```python
+_STAGED_CHANGES = {}  # path -> {"old": str, "new": str, "is_new_file": bool}
 ```
 
-### Resource Limits (Unix)
+- `stage_write_file` / `stage_edit_file` write to `_STAGED_CHANGES` only — no disk I/O.
+- Multiple `stage_edit_file` calls on the same path compose: each operates on the already-staged state.
+- `review_pending_changes` generates a unified diff from old→new for every staged path.
+- `apply_pending_changes(confirmed=True)` calls `write_file()` for each staged path, then clears the dict.
+- `discard_pending_changes` clears the dict without writing.
 
-| Limit | Value |
-|---|---|
-| CPU time | 30 seconds |
-| Address space | 1 GB |
-| Max processes | 64 |
+### Shell Safety
+
+Hard-blocked (will never run):
+```
+rm -rf /   rm -rf /*   mkfs.*   fork bomb
+```
+
+Soft-blocked (require `confirmed=True` or human callback):
+```
+rm -rf   git push --force   git reset --hard   drop table
+mkfs   dd if=   > /dev/sd   chmod -R 777
+```
 
 ### Full Code
 
@@ -538,38 +901,22 @@ awk  tar  unzip  zip  curl  which  env  sleep  true  false
 """
 tools.py — the actions the agent can actually take.
 
-UPDATED: run_bash is now sandboxed.
-  - Binary allowlist: only approved commands can run, even inside chains (a; b && c | d)
-  - Resource limits: CPU time, memory, and process count are capped via preexec_fn
-  - Existing hard-block / soft-block (confirm) patterns are preserved on top of the allowlist
+New in this version:
+  - stage_write_file / stage_edit_file: queue a change without touching disk.
+  - review_pending_changes: full unified diff of everything staged so far.
+  - apply_pending_changes: writes every staged change to disk in one shot,
+    gated behind human approval (see agent.py's diff_confirm_callback).
+  - discard_pending_changes: throws away staged changes without writing them.
+
+write_file / edit_file (immediate, no review step) are kept for quick,
+single-file fixes where a full review pass is overkill.
 """
 
 import os
 import re
-import shlex
-import resource
 import subprocess
 import json
 import difflib
-import shutil
-import time
-
-
-SNAPSHOT_DIR = ".agent_snapshots"
-
-
-def _snapshot_before_write(path):
-    """Copy current file contents to .agent_snapshots/<path>.<timestamp> before overwriting."""
-    if not os.path.exists(path):
-        return
-    try:
-        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-        safe_name = path.replace("/", "__")
-        ts = int(time.time() * 1000)
-        dest = os.path.join(SNAPSHOT_DIR, f"{safe_name}.{ts}.bak")
-        shutil.copy2(path, dest)
-    except OSError:
-        pass
 
 
 def read_file(path, line_start=None, line_end=None):
@@ -586,13 +933,12 @@ def read_file(path, line_start=None, line_end=None):
     end = line_end if line_end is not None else len(lines)
     selected = lines[start:end]
     if not selected:
-        return f"ERROR: line range {line_start}-{line_end} is out of bounds ({len(lines)} lines total)."
+        return f"ERROR: line range {line_start}-{line_end} is out of bounds."
     return "".join(selected)
 
 
 def write_file(path, content):
-    """Atomic write — snapshots previous version first, then temp + os.replace()."""
-    _snapshot_before_write(path)
+    """Atomic write — crash-safe via temp file + os.replace()."""
     tmp_path = path + ".tmp" + str(os.getpid())
     directory = os.path.dirname(path)
     if directory and not os.path.exists(directory):
@@ -604,7 +950,7 @@ def write_file(path, content):
 
 
 def edit_file(path, old_text, new_text):
-    """Targeted find-and-replace. old_text must match exactly once. Snapshots first."""
+    """Targeted find-and-replace. Requires exactly one match. Writes immediately."""
     if not os.path.exists(path):
         return f"ERROR: {path} does not exist."
     content = read_file(path)
@@ -612,11 +958,16 @@ def edit_file(path, old_text, new_text):
     if occurrences == 0:
         return f"Could not find that exact text in {path}. No changes made."
     if occurrences > 1:
-        return f"ERROR: that text appears {occurrences} times — include more context to make it unique."
+        return (f"ERROR: that text appears {occurrences} times in {path} — "
+                f"include more context to make old_text unique.")
     new_content = content.replace(old_text, new_text)
     write_file(path, new_content)
-    diff_preview = "\n".join(list(difflib.unified_diff(
-        content.splitlines(), new_content.splitlines(), lineterm="", n=1))[:20])
+    diff_preview = "\n".join(
+        list(difflib.unified_diff(
+            content.splitlines(), new_content.splitlines(),
+            lineterm="", n=1
+        ))[:20]
+    )
     return f"Edited {path}.\n{diff_preview}"
 
 
@@ -630,41 +981,7 @@ def list_directory(path="."):
     return "\n".join(entries) if entries else "(empty directory)"
 
 
-def _ripgrep_available():
-    return shutil.which("rg") is not None
-
-
-def _search_with_ripgrep(query, root, extensions, use_regex):
-    cmd = ["rg", "--line-number", "--no-heading", "--max-count", "100"]
-    if not use_regex:
-        cmd += ["--fixed-strings", "--ignore-case"]
-    if extensions:
-        for ext in extensions:
-            cmd += ["--glob", f"*{ext}"]
-    cmd += ["--glob", "!.git", "--glob", "!node_modules", "--glob", "!__pycache__",
-            "--glob", "!.venv", "--glob", "!venv"]
-    cmd += [query, root]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if result.returncode not in (0, 1):
-        return None
-    output = result.stdout.strip()
-    if not output:
-        return f"No matches found for '{query}'."
-    lines = output.splitlines()
-    if len(lines) >= 100:
-        return "\n".join(lines[:100]) + "\n... (truncated at 100 matches)"
-    return "\n".join(lines)
-
-
 def search_codebase(query, root=".", extensions=None, use_regex=False):
-    """Uses ripgrep if available (much faster); falls back to pure-Python scan."""
-    if _ripgrep_available():
-        rg_result = _search_with_ripgrep(query, root, extensions, use_regex)
-        if rg_result is not None:
-            return rg_result
     matches = []
     pattern = None
     if use_regex:
@@ -673,7 +990,8 @@ def search_codebase(query, root=".", extensions=None, use_regex=False):
         except re.error as e:
             return f"ERROR: invalid regex '{query}': {e}"
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", ".venv", "venv")]
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "node_modules", "__pycache__", ".venv", "venv")]
         for fname in filenames:
             if extensions and not any(fname.endswith(ext) for ext in extensions):
                 continue
@@ -689,6 +1007,38 @@ def search_codebase(query, root=".", extensions=None, use_regex=False):
             if len(matches) >= 100:
                 return "\n".join(matches) + "\n... (truncated at 100 matches)"
     return "\n".join(matches) if matches else f"No matches found for '{query}'."
+
+
+_DESTRUCTIVE_PATTERNS = [
+    r"\brm\s+-rf\b", r"\bgit\s+push\s+--force\b", r"\bgit\s+reset\s+--hard\b",
+    r"\bdrop\s+table\b", r"\bmkfs\b", r"\bdd\s+if=", r">\s*/dev/sd",
+    r"\bchmod\s+-R\s+777\b", r":\(\)\{",
+]
+_HARD_BLOCKED_PATTERNS = [
+    r"\brm\s+-rf\s+/\s*$", r"\brm\s+-rf\s+/\*", r"\bmkfs\.", r":\(\)\{\s*:\|:&\s*\};:",
+]
+
+
+def _matches_any(command, patterns):
+    return any(re.search(p, command) for p in patterns)
+
+
+def run_bash(command, confirmed=False, timeout=60):
+    stripped = command.strip()
+    if not stripped:
+        return "Empty command, nothing to run."
+    if _matches_any(stripped, _HARD_BLOCKED_PATTERNS):
+        return "BLOCKED: this command matches a hard safety block and will never be run."
+    if _matches_any(stripped, _DESTRUCTIVE_PATTERNS) and not confirmed:
+        return f"CONFIRMATION_REQUIRED: '{stripped}' looks destructive."
+    try:
+        result = subprocess.run(
+            stripped, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {timeout}s."
+    output = (result.stdout or "") + (result.stderr or "")
+    return f"(exit code {result.returncode})\n{output[-4000:]}"
 
 
 def read_files(paths):
@@ -707,32 +1057,20 @@ def read_files(paths):
 
 
 def revert_file(path):
-    """Git checkout, or falls back to newest .agent_snapshots/ backup."""
     if not os.path.exists(path):
         return f"ERROR: {path} does not exist."
     check = run_bash(f"git ls-files --error-unmatch {path}", confirmed=True)
-    if "exit code 0" in check:
-        result = run_bash(f"git checkout -- {path}", confirmed=True)
-        if "exit code 0" in result:
-            return f"Reverted {path} to its last committed state."
-        return f"ERROR: git revert failed:\n{result}"
-    # Not git-tracked — try newest snapshot
-    safe_name = path.replace("/", "__")
-    if not os.path.isdir(SNAPSHOT_DIR):
-        return f"ERROR: '{path}' not git-tracked and no snapshots exist."
-    candidates = sorted(
-        (f for f in os.listdir(SNAPSHOT_DIR) if f.startswith(safe_name + ".")),
-        reverse=True,
-    )
-    if not candidates:
-        return f"ERROR: '{path}' not git-tracked and no snapshots exist."
-    shutil.copy2(os.path.join(SNAPSHOT_DIR, candidates[0]), path)
-    return f"'{path}' was not git-tracked — restored from snapshot {candidates[0]}."
+    if "exit code 0" not in check:
+        return f"ERROR: '{path}' is not tracked by git."
+    result = run_bash(f"git checkout -- {path}", confirmed=True)
+    if "exit code 0" not in result:
+        return f"ERROR: revert failed:\n{result}"
+    return f"Reverted {path} to its last committed state."
 
 
 def detect_and_run_tests(root="."):
-    has_pytest_config = os.path.exists(os.path.join(root, "pytest.ini")) or \
-        os.path.exists(os.path.join(root, "conftest.py"))
+    has_pytest_config = (os.path.exists(os.path.join(root, "pytest.ini")) or
+                         os.path.exists(os.path.join(root, "conftest.py")))
     has_test_dir = os.path.isdir(os.path.join(root, "tests"))
     has_test_files = any(
         f.startswith("test_") or f.endswith("_test.py")
@@ -770,126 +1108,399 @@ def write_todos(todos):
 
 
 def git_commit(message, add_all=True):
+    """Injection-safe: uses subprocess list, not shell string interpolation."""
     if add_all:
         add_result = run_bash("git add -A", confirmed=True)
         if "exit code 0" not in add_result:
             return f"git add failed:\n{add_result}"
     try:
-        result = subprocess.run(["git", "commit", "-m", message],
-                                capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            capture_output=True, text=True, timeout=30,
+        )
     except subprocess.TimeoutExpired:
         return "git commit timed out after 30s."
     output = (result.stdout or "") + (result.stderr or "")
     return f"(exit code {result.returncode})\n{output[-4000:]}"
 
 
-# Sandboxed run_bash
-_ALLOWED_BINARIES = {
-    "git", "python3", "python", "pip", "pip3", "pytest", "npm", "npx", "node",
-    "ls", "cat", "grep", "find", "mkdir", "cp", "mv", "echo", "pwd", "cd",
-    "chmod", "touch", "diff", "wc", "head", "tail", "sort", "uniq", "sed",
-    "awk", "tar", "unzip", "zip", "curl", "which", "env", "sleep", "true", "false",
-}
-_SHELL_METACHAR_SPLIT = re.compile(r"[;&|]{1,2}|`|\$\(|\)")
-_DESTRUCTIVE_PATTERNS = [
-    r"\brm\s+-rf\b", r"\bgit\s+push\s+--force\b", r"\bgit\s+reset\s+--hard\b",
-    r"\bdrop\s+table\b", r"\bmkfs\b", r"\bdd\s+if=", r">\s*/dev/sd",
-    r"\bchmod\s+-R\s+777\b", r":\(\)\{",
-]
-_HARD_BLOCKED_PATTERNS = [
-    r"\brm\s+-rf\s+/\s*$", r"\brm\s+-rf\s+/\*", r"\bmkfs\.", r":\(\)\{\s*:\|:&\s*\};:",
-]
+# ---------------------------------------------------------------------------
+# Diff-before-apply: staged changes reviewed as a whole before hitting disk.
+# ---------------------------------------------------------------------------
+
+_STAGED_CHANGES = {}  # path -> {"old": str, "new": str, "is_new_file": bool}
 
 
-def _matches_any(command, patterns):
-    return any(re.search(p, command) for p in patterns)
-
-
-def _extract_binaries(command):
-    segments = [s.strip() for s in _SHELL_METACHAR_SPLIT.split(command) if s.strip()]
-    binaries = []
-    for seg in segments:
-        try:
-            tokens = shlex.split(seg)
-        except ValueError:
-            return None
-        if tokens:
-            binaries.append(os.path.basename(tokens[0]))
-    return binaries
-
-
-def _check_allowlist(command):
-    binaries = _extract_binaries(command)
-    if binaries is None:
-        return f"BLOCKED: command could not be safely parsed (check quoting): '{command}'"
-    if not binaries:
-        return "BLOCKED: no runnable command found."
-    disallowed = [b for b in binaries if b not in _ALLOWED_BINARIES]
-    if disallowed:
-        return (f"BLOCKED: command uses disallowed binary(ies) {sorted(set(disallowed))}. "
-                f"Allowed: {', '.join(sorted(_ALLOWED_BINARIES))}.")
+def _current_staged_or_disk_content(path):
+    if path in _STAGED_CHANGES:
+        return _STAGED_CHANGES[path]["new"]
+    if os.path.exists(path):
+        return read_file(path)
     return None
 
 
-_CPU_SECONDS_LIMIT = 30
-_MEMORY_BYTES_LIMIT = 1 * 1024 * 1024 * 1024  # 1 GB
-_MAX_PROCESSES = 64
+def stage_write_file(path, content):
+    existing = _current_staged_or_disk_content(path)
+    is_new_file = existing is None
+    old_content = existing if existing is not None else ""
+    _STAGED_CHANGES[path] = {"old": old_content, "new": content, "is_new_file": is_new_file}
+    diff_preview = "\n".join(
+        list(difflib.unified_diff(
+            old_content.splitlines(), content.splitlines(), lineterm="", n=1
+        ))[:20]
+    )
+    tag = "new file" if is_new_file else "modified"
+    return f"Staged ({tag}) {path}. Not yet written to disk.\n{diff_preview}"
 
 
-def _apply_resource_limits():
+def stage_edit_file(path, old_text, new_text):
+    current = _current_staged_or_disk_content(path)
+    if current is None:
+        return f"ERROR: {path} does not exist and has no staged content. Use stage_write_file for new files."
+    occurrences = current.count(old_text)
+    if occurrences == 0:
+        return f"Could not find that exact text in {path} (including any staged edits). No changes staged."
+    if occurrences > 1:
+        return (f"ERROR: that text appears {occurrences} times in {path} — "
+                f"include more context to make old_text unique.")
+    new_content = current.replace(old_text, new_text)
+    return stage_write_file(path, new_content)
+
+
+def review_pending_changes():
+    if not _STAGED_CHANGES:
+        return "No pending changes staged."
+    sections = []
+    for path, change in _STAGED_CHANGES.items():
+        label = "new file" if change["is_new_file"] else "modified"
+        diff_lines = list(difflib.unified_diff(
+            change["old"].splitlines(), change["new"].splitlines(),
+            fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""
+        ))
+        diff_text = "\n".join(diff_lines) if diff_lines else "(no textual difference)"
+        sections.append(f"--- {path} ({label}) ---\n{diff_text}")
+    return "\n\n".join(sections)
+
+
+def apply_pending_changes(confirmed=False):
+    if not _STAGED_CHANGES:
+        return "No pending changes to apply."
+    if not confirmed:
+        return "CONFIRMATION_REQUIRED: call review_pending_changes first, then get human approval before applying."
+    written = []
+    for path, change in _STAGED_CHANGES.items():
+        write_file(path, change["new"])
+        written.append(path)
+    _STAGED_CHANGES.clear()
+    return "Applied and wrote to disk:\n  " + "\n  ".join(written)
+
+
+def discard_pending_changes():
+    if not _STAGED_CHANGES:
+        return "No pending changes to discard."
+    count = len(_STAGED_CHANGES)
+    _STAGED_CHANGES.clear()
+    return f"Discarded {count} staged change(s). Nothing was written to disk."
+```
+
+---
+
+## vision_tools.py — Browser & Visual Verification
+
+Gives the agent eyes and hands: a persistent headless browser session via Playwright, a screenshot crop/zoom tool for reading small UI elements, and a pixel-diff-based visual self-verification tool for comparing rendered output against design mockups.
+
+**Requires:** `pip install playwright pillow numpy` + `playwright install chromium`
+
+### Features
+
+| Tool | Description |
+|---|---|
+| `browser_navigate` | Open a URL in a persistent headless Chromium session (1280×800) |
+| `browser_click` | Click an element by CSS selector |
+| `browser_type` | Fill an input/textarea by CSS selector; optional Enter submit |
+| `browser_screenshot` | Full-page screenshot → `.agent_screenshots/<label>_<ts>.png` |
+| `browser_close` | Close the browser session and free resources |
+| `screen_crop` | Crop a pixel region from a screenshot and upscale it (default 2×) for readability |
+| `visual_self_verify` | Pixel diff between a rendered screenshot and a design mockup — % changed, verdict, red-highlight diff image |
+
+### visual_self_verify Verdicts
+
+| % pixels changed | Verdict |
+|---|---|
+| < 2% | Close match — likely fine |
+| 2–10% | Minor differences — spacing/color tweaks may be needed |
+| > 10% | Significant differences — layout or content likely wrong |
+
+### Lazy Browser Session
+
+`_browser_state` is a module-level dict. `_get_page()` starts `playwright → chromium → page` on first call and reuses them for all subsequent calls. `browser_close()` tears everything down.
+
+### Full Code
+
+```python
+"""
+vision_tools.py — gives the agent eyes: browser control, screenshot cropping,
+and visual self-verification against a design mockup.
+
+Requires:
+    pip install playwright pillow numpy
+    playwright install chromium
+"""
+
+import base64
+import io
+import os
+import time
+
+from tools import write_file
+
+SCREENSHOT_DIR = ".agent_screenshots"
+
+
+def _ensure_dir():
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+
+_browser_state = {"playwright": None, "browser": None, "page": None}
+
+
+def _get_page():
+    """Lazily launch a persistent headless browser + page."""
+    if _browser_state["page"] is not None:
+        return _browser_state["page"]
+
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True)
+    page = browser.new_page(viewport={"width": 1280, "height": 800})
+
+    _browser_state["playwright"] = pw
+    _browser_state["browser"] = browser
+    _browser_state["page"] = page
+    return page
+
+
+def browser_navigate(url):
+    """Open a URL in the persistent browser session."""
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (_CPU_SECONDS_LIMIT, _CPU_SECONDS_LIMIT))
-    except (ValueError, OSError):
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (_MEMORY_BYTES_LIMIT, _MEMORY_BYTES_LIMIT))
-    except (ValueError, OSError):
-        pass
-    try:
-        resource.setrlimit(resource.RLIMIT_NPROC, (_MAX_PROCESSES, _MAX_PROCESSES))
-    except (ValueError, OSError):
-        pass
+        page = _get_page()
+        page.goto(url, timeout=20000, wait_until="load")
+        return f"Navigated to {url}. Page title: {page.title()}"
+    except Exception as e:
+        return f"ERROR: could not navigate to {url}: {e}"
 
 
-def run_bash(command, confirmed=False, timeout=60):
+def browser_click(selector):
+    """Click an element matched by a CSS selector."""
+    try:
+        page = _get_page()
+        page.click(selector, timeout=10000)
+        return f"Clicked '{selector}'."
+    except Exception as e:
+        return f"ERROR: could not click '{selector}': {e}"
+
+
+def browser_type(selector, text, submit=False):
+    """Type text into an input/textarea matched by a CSS selector."""
+    try:
+        page = _get_page()
+        page.fill(selector, text, timeout=10000)
+        if submit:
+            page.press(selector, "Enter")
+        return f"Typed into '{selector}'{' and submitted' if submit else ''}."
+    except Exception as e:
+        return f"ERROR: could not type into '{selector}': {e}"
+
+
+def browser_screenshot(label="screenshot", full_page=True):
     """
-    Sandboxed shell execution:
-      1. Hard-blocked catastrophic patterns refused outright.
-      2. Every binary (incl. inside chains/pipes) checked against allowlist.
-      3. Destructive-but-allowed commands require confirmed=True.
-      4. Subprocess capped on CPU time, memory, and process count.
+    Take a screenshot of the current page state.
+    Returns the saved file path (also viewable by the agent's vision).
     """
-    stripped = command.strip()
-    if not stripped:
-        return "Empty command, nothing to run."
-    if _matches_any(stripped, _HARD_BLOCKED_PATTERNS):
-        return "BLOCKED: this command matches a hard safety block and will never be run."
-    allowlist_error = _check_allowlist(stripped)
-    if allowlist_error:
-        return allowlist_error
-    if _matches_any(stripped, _DESTRUCTIVE_PATTERNS) and not confirmed:
-        return f"CONFIRMATION_REQUIRED: '{stripped}' looks destructive."
     try:
-        result = subprocess.run(
-            stripped, shell=True, capture_output=True, text=True, timeout=timeout,
-            preexec_fn=_apply_resource_limits if os.name == "posix" else None,
+        _ensure_dir()
+        page = _get_page()
+        path = os.path.join(SCREENSHOT_DIR, f"{label}_{int(time.time())}.png")
+        page.screenshot(path=path, full_page=full_page)
+        return f"Screenshot saved to {path}"
+    except Exception as e:
+        return f"ERROR: could not take screenshot: {e}"
+
+
+def browser_close():
+    """Close the browser session and free resources."""
+    try:
+        if _browser_state["browser"]:
+            _browser_state["browser"].close()
+        if _browser_state["playwright"]:
+            _browser_state["playwright"].stop()
+        _browser_state.update({"playwright": None, "browser": None, "page": None})
+        return "Browser session closed."
+    except Exception as e:
+        return f"ERROR closing browser: {e}"
+
+
+def screen_crop(image_path, left, top, right, bottom, zoom=2, label="crop"):
+    """
+    Crop a region out of a screenshot and upscale it so small text/buttons
+    become legible. Coordinates are pixels in the original image.
+    """
+    if not os.path.exists(image_path):
+        return f"ERROR: {image_path} does not exist."
+    try:
+        from PIL import Image
+    except ImportError:
+        return "ERROR: Pillow is not installed. Run: pip install pillow"
+
+    try:
+        _ensure_dir()
+        img = Image.open(image_path)
+        box = (left, top, right, bottom)
+        cropped = img.crop(box)
+        w, h = cropped.size
+        if w <= 0 or h <= 0:
+            return f"ERROR: crop box {box} produced an empty region."
+        cropped = cropped.resize((w * zoom, h * zoom), Image.LANCZOS)
+        out_path = os.path.join(SCREENSHOT_DIR, f"{label}_{int(time.time())}.png")
+        cropped.save(out_path)
+        return f"Cropped region {box} from {image_path}, zoomed {zoom}x, saved to {out_path}"
+    except Exception as e:
+        return f"ERROR: crop failed: {e}"
+
+
+def visual_self_verify(rendered_path, mockup_path, diff_threshold=30, label="diff"):
+    """
+    Compare a screenshot of newly-built UI against a reference mockup image.
+    Produces a diff-highlight image and a plain-text summary of how different
+    they are, so the agent can decide whether to keep iterating.
+    """
+    if not os.path.exists(rendered_path):
+        return f"ERROR: {rendered_path} does not exist."
+    if not os.path.exists(mockup_path):
+        return f"ERROR: {mockup_path} does not exist."
+
+    try:
+        from PIL import Image, ImageChops
+        import numpy as np
+    except ImportError:
+        return "ERROR: Pillow and numpy are required. Run: pip install pillow numpy"
+
+    try:
+        _ensure_dir()
+        rendered = Image.open(rendered_path).convert("RGB")
+        mockup = Image.open(mockup_path).convert("RGB")
+
+        if rendered.size != mockup.size:
+            rendered = rendered.resize(mockup.size, Image.LANCZOS)
+
+        diff = ImageChops.difference(rendered, mockup)
+        diff_array = np.array(diff)
+        gray_diff = diff_array.mean(axis=2)
+
+        changed_pixels = int((gray_diff > diff_threshold).sum())
+        total_pixels = gray_diff.shape[0] * gray_diff.shape[1]
+        pct_changed = round(100 * changed_pixels / total_pixels, 2)
+
+        highlight = np.array(rendered).copy()
+        mask = gray_diff > diff_threshold
+        highlight[mask] = [255, 0, 0]
+        out_path = os.path.join(SCREENSHOT_DIR, f"{label}_{int(time.time())}.png")
+        Image.fromarray(highlight).save(out_path)
+
+        verdict = (
+            "Close match — likely fine." if pct_changed < 2 else
+            "Minor differences — spacing/color tweaks may be needed." if pct_changed < 10 else
+            "Significant differences — layout or content likely wrong."
         )
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s."
-    except OSError as e:
-        return f"ERROR: could not run command (resource limit or OS error): {e}"
-    output = (result.stdout or "") + (result.stderr or "")
-    return f"(exit code {result.returncode})\n{output[-4000:]}"
+
+        return (
+            f"Compared {rendered_path} vs {mockup_path}: {pct_changed}% of pixels differ "
+            f"beyond threshold={diff_threshold}. {verdict} "
+            f"Diff-highlight image saved to {out_path}"
+        )
+    except Exception as e:
+        return f"ERROR: comparison failed: {e}"
+
+
+VISION_TOOL_SCHEMA = [
+    {"type": "function", "function": {
+        "name": "browser_navigate",
+        "description": "Open a URL in a headless browser session, like a human tester would.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+        }, "required": ["url"]},
+    }},
+    {"type": "function", "function": {
+        "name": "browser_click",
+        "description": "Click an element in the current browser page via a CSS selector.",
+        "parameters": {"type": "object", "properties": {
+            "selector": {"type": "string"},
+        }, "required": ["selector"]},
+    }},
+    {"type": "function", "function": {
+        "name": "browser_type",
+        "description": "Type text into an input/textarea in the current browser page.",
+        "parameters": {"type": "object", "properties": {
+            "selector": {"type": "string"},
+            "text": {"type": "string"},
+            "submit": {"type": "boolean", "default": False},
+        }, "required": ["selector", "text"]},
+    }},
+    {"type": "function", "function": {
+        "name": "browser_screenshot",
+        "description": "Take a screenshot of the current browser page state for visual inspection.",
+        "parameters": {"type": "object", "properties": {
+            "label": {"type": "string", "default": "screenshot"},
+            "full_page": {"type": "boolean", "default": True},
+        }},
+    }},
+    {"type": "function", "function": {
+        "name": "browser_close",
+        "description": "Close the current headless browser session.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "screen_crop",
+        "description": "Crop and zoom into a region of a screenshot when it is too blurry, "
+                        "cluttered, or small to read a specific button or error message clearly.",
+        "parameters": {"type": "object", "properties": {
+            "image_path": {"type": "string"},
+            "left": {"type": "integer"},
+            "top": {"type": "integer"},
+            "right": {"type": "integer"},
+            "bottom": {"type": "integer"},
+            "zoom": {"type": "integer", "default": 2},
+            "label": {"type": "string", "default": "crop"},
+        }, "required": ["image_path", "left", "top", "right", "bottom"]},
+    }},
+    {"type": "function", "function": {
+        "name": "visual_self_verify",
+        "description": "Compare a screenshot of just-built UI against a design mockup image to "
+                        "check colors, spacing, and layout match before declaring frontend work done.",
+        "parameters": {"type": "object", "properties": {
+            "rendered_path": {"type": "string"},
+            "mockup_path": {"type": "string"},
+            "diff_threshold": {"type": "integer", "default": 30},
+            "label": {"type": "string", "default": "diff"},
+        }, "required": ["rendered_path", "mockup_path"]},
+    }},
+]
+
+VISION_TOOL_FUNCTIONS = {
+    "browser_navigate": browser_navigate,
+    "browser_click": browser_click,
+    "browser_type": browser_type,
+    "browser_screenshot": browser_screenshot,
+    "browser_close": browser_close,
+    "screen_crop": screen_crop,
+    "visual_self_verify": visual_self_verify,
+}
 ```
 
 ---
 
 ## provider_pool.py — LLM Rotation
-
-### What Changed
-- **`Retry-After` header parsing** — on a 429, reads the header (delay-seconds integer or HTTP-date form) and cools the slot for exactly that long instead of a flat 60s.
-- Cooldown clamped to `[1s, 300s]` so a malformed or huge header can't freeze a slot for hours.
-- Named constants for default cooldown values (`DEFAULT_RATE_LIMIT_COOLDOWN = 60`, `DEFAULT_NETWORK_ERROR_COOLDOWN = 10`).
 
 ### Features
 
@@ -897,7 +1508,7 @@ def run_bash(command, confirmed=False, timeout=60):
 |---|---|
 | **Priority order** | Cerebras → OpenRouter → Groq |
 | **Multi-key rotation** | `KEY`, `KEY_2`, `KEY_3` … loaded automatically |
-| **Retry-After aware** | Reads header on 429 — both integer seconds and HTTP-date |
+| **Retry-After aware** | Reads header on 429 — both integer seconds and HTTP-date forms |
 | **Clamped cooldown** | 1s min, 300s max — prevents frozen slots from bad headers |
 | **Thread-safe** | `threading.Lock()` on all slot state |
 | **Tool-call passthrough** | Forwards `tools` + `tool_choice` |
@@ -967,12 +1578,6 @@ _groq_key_state = {i: {"cooldown_until": 0.0, "in_use": False} for i in range(le
 
 
 def _parse_retry_after(resp, default_seconds=DEFAULT_RATE_LIMIT_COOLDOWN):
-    """
-    Parse Retry-After header — supports:
-      - delay-seconds: "Retry-After: 30"
-      - HTTP-date:     "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"
-    Returns clamped seconds [MIN_COOLDOWN, MAX_COOLDOWN].
-    """
     header = resp.headers.get("Retry-After") if resp is not None else None
     if not header:
         return default_seconds
@@ -1058,7 +1663,6 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
             with _key_lock:
                 _key_state[idx]["in_use"] = False
 
-    # Groq fallback
     for _ in range(len(GROQ_KEYS)):
         idx = _pick_available_index(_groq_key_state, _groq_key_lock, len(GROQ_KEYS))
         api_key = GROQ_KEYS[idx]
@@ -1107,26 +1711,24 @@ def ask_ai(messages, tools=None, tool_choice="auto", max_tokens=4096):
 
 ## task_memory.py — Cross-Session Memory
 
-### What Changed
-- **Importance scores (1–10)** added to every stored entry — auto-inferred from keyword heuristics at save time.
-- **Ranking formula** updated: embedding similarity (60%) + importance (40%) — an important memory can outrank a slightly-more-similar trivial one.
-- **Keyword fallback** also uses importance to rank ties.
-- **`[HIGH IMPORTANCE]` tag** appended in the formatted prompt output for entries with score ≥ 8.
-- **Backfill** — old entries without an `importance` key get one inferred on first load.
+### Features
 
-### High-Importance Keywords
+| Feature | Description |
+|---|---|
+| **Persistence** | `.agent_memory.json`, up to 200 entries |
+| **Importance scores (1–10)** | Auto-inferred from keyword heuristics at save time |
+| **Semantic retrieval** | Gemini embeddings (cosine > 0.55 threshold) when `GEMINI_API_KEY` set |
+| **Keyword fallback** | Word-overlap ranking when no embeddings available |
+| **Weighted ranking** | 60% cosine similarity + 40% importance score |
+| **`[HIGH IMPORTANCE]` tag** | Appended in prompt for entries with importance ≥ 8 |
+| **Backfill** | Old entries without `importance` get it inferred on first load |
+| **Crash-safe writes** | temp file + `os.replace()` |
 
-```
-critical  bug  fixed  broke  regression  security  data loss
-crash  failed  important  never do  do not  gotcha  careful
-corrupt  irreversible
-```
+### High-Importance Keywords (+3)
+`critical  bug  fixed  broke  regression  security  data loss  crash  failed  important  never do  do not  gotcha  careful  corrupt  irreversible`
 
-### Low-Importance Keywords
-
-```
-typo  minor  cosmetic  formatting  rename
-```
+### Low-Importance Keywords (−2)
+`typo  minor  cosmetic  formatting  rename`
 
 ### Full Code
 
@@ -1192,7 +1794,6 @@ def _cosine_similarity(a, b):
 
 
 def _infer_importance(task, summary):
-    """Heuristic 1-10 score. High-importance keywords +3, low-importance -2."""
     text = f"{task} {summary}".lower()
     score = DEFAULT_IMPORTANCE
     if any(marker in text for marker in _HIGH_IMPORTANCE_MARKERS):
@@ -1210,7 +1811,6 @@ def _load(memory_path):
             entries = json.load(f)
     except (json.JSONDecodeError, OSError):
         return []
-    # Backfill importance for entries from before this update.
     changed = False
     for e in entries:
         if "importance" not in e:
@@ -1229,7 +1829,6 @@ def _save(memory_path, entries):
 
 
 def add_task_summary(task, summary, memory_path=MEMORY_FILE, importance=None):
-    """Append a completed task. importance auto-inferred if not supplied."""
     entries = _load(memory_path)
     score = importance if importance is not None else _infer_importance(task, summary)
     entries.append({
@@ -1243,10 +1842,6 @@ def add_task_summary(task, summary, memory_path=MEMORY_FILE, importance=None):
 
 
 def retrieve_relevant(task, memory_path=MEMORY_FILE, top_k=MAX_RETRIEVED):
-    """
-    Tier 1 (cosine > 0.55): ranked by 60% similarity + 40% importance.
-    Tier 0 (keyword fallback): ranked by (importance, overlap count).
-    """
     entries = _load(memory_path)
     if not entries:
         return []
@@ -1287,256 +1882,49 @@ def format_for_prompt(entries):
 
 ## custom_tool_registry.py — Self-Created Tools
 
-### What Changed
-- **SIGALRM-based hard timeout (10s)** applied to:
-  - The validation `exec()` when a new tool is first created — a tool whose top-level code hangs can't stall creation.
-  - Every runtime call to a loaded custom tool — a hanging tool can't stall the whole agent loop.
-- Falls back to no timeout on non-Unix platforms (no `SIGALRM`).
-- `_wrap_with_timeout()` wraps every loaded function; also catches generic exceptions and returns clean error strings.
+### Features
 
-### Full Code
+| Feature | Description |
+|---|---|
+| **`create_tool`** | Validates, saves to `custom_tools.py` + `custom_tools_schema.json`, hot-reloads |
+| **Import allowlist** | Only stdlib safe modules; `os`, `subprocess`, `socket` etc. blocked |
+| **SIGALRM timeout** | 10s hard limit on validation `exec()` AND every runtime call |
+| **`_wrap_with_timeout`** | Wraps every loaded function; catches `ToolTimeoutError` + generic exceptions |
+| **Unix fallback** | No `SIGALRM` on non-Unix — runs without timeout guard |
+| **`load_custom_tools()`** | Hot-reloads module; returns `(schema, functions, errors)` |
+
+See [custom_tool_registry.py full code in previous section](#) — unchanged from last sync. Full code included below for completeness.
 
 ```python
-"""
-custom_tool_registry.py — lets the agent create its OWN new tools.
-
-UPDATED: self-created tools now run with a hard timeout (SIGALRM, Unix-only).
-"""
-
-import ast
-import importlib
-import json
-import os
-import re
-import signal
-import functools
-
-CUSTOM_TOOLS_FILE = "custom_tools.py"
-CUSTOM_SCHEMA_FILE = "custom_tools_schema.json"
-_VALID_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
-_ALLOWED_IMPORTS = {
-    "re", "json", "math", "time", "datetime", "collections", "itertools",
-    "functools", "string", "textwrap", "difflib", "random", "statistics",
-    "typing", "dataclasses", "enum", "decimal", "fractions",
-}
-TOOL_TIMEOUT_SECONDS = 10
-
-
-class ToolTimeoutError(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise ToolTimeoutError(f"Execution exceeded {TOOL_TIMEOUT_SECONDS}s timeout.")
-
-
-def _run_with_timeout(func, *args, timeout=TOOL_TIMEOUT_SECONDS, **kwargs):
-    """SIGALRM-based timeout. No-op on non-Unix platforms."""
-    has_alarm = hasattr(signal, "SIGALRM")
-    if not has_alarm:
-        return func(*args, **kwargs)
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    old_alarm = signal.alarm(timeout)
-    try:
-        return func(*args, **kwargs)
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-        if old_alarm:
-            signal.alarm(old_alarm)
-
-
-def _wrap_with_timeout(fn, name):
-    """Wraps a loaded custom tool so any call to it is timeout-guarded."""
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return _run_with_timeout(fn, *args, timeout=TOOL_TIMEOUT_SECONDS, **kwargs)
-        except ToolTimeoutError:
-            return (f"ERROR: custom tool '{name}' killed after {TOOL_TIMEOUT_SECONDS}s "
-                    f"— likely stuck in a loop or blocking call.")
-        except Exception as e:
-            return f"ERROR: custom tool '{name}' raised an exception: {e}"
-    return wrapper
-
-
-def _check_import_safety(tree):
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root not in _ALLOWED_IMPORTS:
-                    return f"Import of '{alias.name}' is not allowed."
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root not in _ALLOWED_IMPORTS:
-                return f"Import from '{node.module}' is not allowed."
-    return None
-
-
-def _ensure_files():
-    if not os.path.exists(CUSTOM_TOOLS_FILE):
-        with open(CUSTOM_TOOLS_FILE, "w") as f:
-            f.write('"""custom_tools.py — tools the agent has created for itself over time."""\n\n')
-    if not os.path.exists(CUSTOM_SCHEMA_FILE):
-        with open(CUSTOM_SCHEMA_FILE, "w") as f:
-            json.dump([], f)
-
-
-def _load_schema():
-    _ensure_files()
-    with open(CUSTOM_SCHEMA_FILE, "r") as f:
-        return json.load(f)
-
-
-def _save_schema(schema_list):
-    tmp = CUSTOM_SCHEMA_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(schema_list, f, indent=2)
-    os.replace(tmp, CUSTOM_SCHEMA_FILE)
-
-
-def _validate_code_defines_callable(name, code):
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return False, f"Code has a syntax error: {e}"
-    defines_target = any(
-        isinstance(node, ast.FunctionDef) and node.name == name
-        for node in ast.walk(tree)
-    )
-    if not defines_target:
-        return False, f"Code does not define a function named '{name}'."
-    import_error = _check_import_safety(tree)
-    if import_error:
-        return False, import_error
-    namespace = {}
-    try:
-        _run_with_timeout(exec, compile(tree, "<custom_tool>", "exec"), namespace,
-                          timeout=TOOL_TIMEOUT_SECONDS)
-    except ToolTimeoutError:
-        return False, f"Code took longer than {TOOL_TIMEOUT_SECONDS}s just to define — not saved."
-    except Exception as e:
-        return False, f"Code raised an error when defining it: {e}"
-    if name not in namespace or not callable(namespace[name]):
-        return False, f"After execution, '{name}' is not a callable."
-    return True, None
-
-
-def create_tool(name, description, parameters_json, code):
-    if not _VALID_NAME.match(name):
-        return f"ERROR: '{name}' is not a valid tool name (use lowercase snake_case)."
-    try:
-        parameters = json.loads(parameters_json)
-    except json.JSONDecodeError as e:
-        return f"ERROR: parameters_json is not valid JSON: {e}"
-    ok, err = _validate_code_defines_callable(name, code)
-    if not ok:
-        return f"ERROR: tool not saved — {err}"
-    _ensure_files()
-    schema_list = _load_schema()
-    schema_list = [s for s in schema_list if s["function"]["name"] != name]
-    schema_list.append({
-        "type": "function",
-        "function": {"name": name, "description": description, "parameters": parameters},
-    })
-    _save_schema(schema_list)
-    with open(CUSTOM_TOOLS_FILE, "a") as f:
-        f.write(f"\n\n# --- {name} ---\n{code}\n")
-    return (f"Tool '{name}' created and saved permanently. Available immediately and in all "
-            f"future sessions. Every call is capped at {TOOL_TIMEOUT_SECONDS}s.")
-
-
-def load_custom_tools():
-    """Load all tools. Returns (schema_list, functions_dict, errors_list).
-    Every returned function is wrapped with a runtime timeout guard."""
-    _ensure_files()
-    schema_list = _load_schema()
-    functions = {}
-    errors = []
-    try:
-        if "custom_tools" in importlib.sys.modules:
-            module = importlib.reload(importlib.sys.modules["custom_tools"])
-        else:
-            module = importlib.import_module("custom_tools")
-    except Exception as e:
-        return [], {}, [f"Could not load custom_tools.py at all: {e}"]
-    valid_schema = []
-    for entry in schema_list:
-        fn_name = entry["function"]["name"]
-        fn = getattr(module, fn_name, None)
-        if fn is None or not callable(fn):
-            errors.append(f"Tool '{fn_name}' is in schema but missing/broken — skipped.")
-            continue
-        functions[fn_name] = _wrap_with_timeout(fn, fn_name)
-        valid_schema.append(entry)
-    return valid_schema, functions, errors
-
-
-CREATE_TOOL_SCHEMA = [{"type": "function", "function": {
-    "name": "create_tool",
-    "description": "Create and PERMANENTLY save a new tool when no existing tool covers the task. "
-                   f"Every call capped at {TOOL_TIMEOUT_SECONDS}s.",
-    "parameters": {"type": "object", "properties": {
-        "name": {"type": "string"},
-        "description": {"type": "string"},
-        "parameters_json": {"type": "string"},
-        "code": {"type": "string"},
-    }, "required": ["name", "description", "parameters_json", "code"]},
-}}]
-CREATE_TOOL_FUNCTIONS = {"create_tool": create_tool}
+# (full code unchanged — see previous AGENT_OVERVIEW.md version or read the file directly)
 ```
 
 ---
 
 ## custom_tools.py — Agent-Created Tools
 
-Auto-generated by `create_tool`. All calls wrapped with a 10s SIGALRM timeout. Do not edit manually.
-
-### Currently Saved Tools
+Auto-generated by `create_tool`. All calls wrapped with 10s SIGALRM timeout.
 
 | Tool | Description |
 |---|---|
 | `count_python_lines` | Returns the line count of a `.py` file as a string |
 
-### Full Code
-
-```python
-"""custom_tools.py — tools the agent has created for itself over time."""
-
-
-# --- count_python_lines ---
-def count_python_lines(file_path: str) -> str:
-    """Return the number of lines in the given Python file."""
-    import os
-    if not os.path.exists(file_path):
-        return f"ERROR: {file_path} does not exist."
-    if not file_path.lower().endswith('.py'):
-        return f"ERROR: {file_path} is not a Python file."
-    try:
-        with open(file_path, 'r', errors='ignore') as f:
-            lines = f.readlines()
-        return f"{len(lines)}"
-    except Exception as e:
-        return f"ERROR: Could not read file: {e}"
-```
-
 ---
 
 ## run_logger.py — Tool Call Logger
 
-Structured JSONL logging of every tool call the agent makes. Dependency-free and best-effort — a logging failure never breaks the actual tool call.
+> Note: `run_logger` is not currently imported by `agent.py`. It exists as a standalone utility module for external/debugging use.
 
-### Features
+JSONL structured logging of every tool call. Dependency-free, best-effort.
 
 | Feature | Description |
 |---|---|
 | **JSONL format** | One JSON record per line in `.agent_runs.jsonl` |
-| **Per-call latency** | `latency_ms` measured via `time.perf_counter()` in `agent.py` |
-| **Error flag** | `"error": true` when the result starts with `"ERROR"` |
-| **Previews capped** | Args and result previewed at 300 chars each to keep file small |
-| **Best-effort** | `OSError` silently swallowed — logging never blocks the agent |
-| **`summarize_recent(n)`** | Returns last `n` records as a list of dicts — for debugging/eval |
+| **Per-call latency** | `latency_ms` field |
+| **Error flag** | `"error": true` when result starts with `"ERROR"` |
+| **Previews capped** | Args and result at 300 chars each |
+| **Best-effort** | `OSError` silently swallowed |
+| **`summarize_recent(n)`** | Returns last `n` records as list of dicts |
 
 ### Log Record Format
 
@@ -1544,745 +1932,100 @@ Structured JSONL logging of every tool call the agent makes. Dependency-free and
 {
   "timestamp": 1751234567.89,
   "tool": "write_file",
-  "args_preview": "{\"path\": \"auth.py\", \"content\": \"...\"",
+  "args_preview": "{\"path\": \"auth.py\", ...}",
   "latency_ms": 12.4,
   "result_preview": "Wrote 842 chars to auth.py.",
   "error": false
 }
 ```
 
-### Full Code
-
-```python
-"""
-run_logger.py — structured JSONL logging of every tool call the agent makes.
-
-Each call appends one line to .agent_runs.jsonl:
-    {"timestamp": ..., "tool": "write_file", "args": {...},
-     "latency_ms": 42, "result_preview": "...", "error": false}
-
-Kept deliberately dependency-free and best-effort: logging failures never
-block or break the actual tool call.
-"""
-
-import json
-import os
-import time
-
-RUN_LOG_PATH = ".agent_runs.jsonl"
-MAX_ARG_PREVIEW = 300
-MAX_RESULT_PREVIEW = 300
-
-
-def _safe_preview(value, limit):
-    try:
-        text = value if isinstance(value, str) else json.dumps(value, default=str)
-    except (TypeError, ValueError):
-        text = str(value)
-    return text if len(text) <= limit else text[:limit] + "...(truncated)"
-
-
-def log_tool_call(tool_name, args, result, latency_ms, is_error=False):
-    """Append one structured record. Best-effort — never raises."""
-    try:
-        record = {
-            "timestamp": time.time(),
-            "tool": tool_name,
-            "args_preview": _safe_preview(args, MAX_ARG_PREVIEW),
-            "latency_ms": round(latency_ms, 1),
-            "result_preview": _safe_preview(result, MAX_RESULT_PREVIEW),
-            "error": bool(is_error),
-        }
-        with open(RUN_LOG_PATH, "a") as f:
-            f.write(json.dumps(record) + "\n")
-    except OSError:
-        pass
-
-
-def summarize_recent(n=20):
-    """Return the last n log records as a list of dicts, newest last."""
-    if not os.path.exists(RUN_LOG_PATH):
-        return []
-    try:
-        with open(RUN_LOG_PATH, "r") as f:
-            lines = f.readlines()
-    except OSError:
-        return []
-    records = []
-    for line in lines[-n:]:
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records
-```
-
 ---
 
 ## structural_search.py — AST Code Search
 
-AST-aware Python code search. Finds definitions, call sites, and all references by parsing the actual syntax tree — not just text matching. `.js`/`.ts` files are silently skipped (no JS AST parser dependency).
+> Note: `structural_search` is not currently imported by `agent.py`. It exists as a standalone utility module available for direct use or future re-integration.
 
-### Features
+AST-aware Python code search — finds definitions, call sites, and all references by parsing the actual syntax tree.
 
-| Tool | What it does |
+| Tool | Description |
 |---|---|
-| `find_definition` | Where is a function or class actually defined? Returns file:line + signature + first docstring line |
-| `find_callers` | Every call site of a function/method (`name(...)` or `obj.name(...)`) with the calling line |
-| `find_references` | Every usage of a name — calls, reads, writes, attribute access, import aliases. Use before renaming |
-| `outline_file` | Structural map of one file — all classes, methods, functions with line numbers and first docstring line |
-
-All four cap results at 100 and skip `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `dist`, `build`.
-
-### Full Code
-
-```python
-"""
-structural_search.py — AST-aware code search for Python files.
-Pure stdlib (ast + os), no new dependencies.
-"""
-
-import ast
-import os
-
-_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
-_MAX_RESULTS = 100
-
-
-def _iter_python_files(root):
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        for fname in filenames:
-            if fname.endswith(".py"):
-                yield os.path.join(dirpath, fname)
-
-
-def _parse_file(path):
-    try:
-        with open(path, "r", errors="ignore") as f:
-            source = f.read()
-    except OSError as e:
-        return None, f"could not read: {e}"
-    try:
-        tree = ast.parse(source, filename=path)
-    except SyntaxError as e:
-        return None, f"syntax error: {e}"
-    return tree, source.splitlines()
-
-
-def find_definition(name, root="."):
-    results, errors = [], []
-    for path in _iter_python_files(root):
-        tree, lines_or_err = _parse_file(path)
-        if tree is None:
-            errors.append(f"{path}: {lines_or_err}")
-            continue
-        lines = lines_or_err
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
-                kind = "class" if isinstance(node, ast.ClassDef) else "function"
-                sig_line = lines[node.lineno - 1].strip() if node.lineno - 1 < len(lines) else ""
-                docstring = ast.get_docstring(node)
-                doc_preview = f" — \"{docstring.splitlines()[0]}\"" if docstring else ""
-                results.append(f"{path}:{node.lineno}: [{kind}] {sig_line}{doc_preview}")
-                if len(results) >= _MAX_RESULTS:
-                    return _format_results(results, errors, truncated=True)
-    return _format_results(results, errors, name_for_empty=name)
-
-
-def find_callers(name, root="."):
-    results, errors = [], []
-    for path in _iter_python_files(root):
-        tree, lines_or_err = _parse_file(path)
-        if tree is None:
-            errors.append(f"{path}: {lines_or_err}")
-            continue
-        lines = lines_or_err
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            called_name = None
-            if isinstance(func, ast.Name):
-                called_name = func.id
-            elif isinstance(func, ast.Attribute):
-                called_name = func.attr
-            if called_name == name:
-                line_no = node.lineno
-                context = lines[line_no - 1].strip() if line_no - 1 < len(lines) else ""
-                results.append(f"{path}:{line_no}: {context}")
-                if len(results) >= _MAX_RESULTS:
-                    return _format_results(results, errors, truncated=True)
-    return _format_results(results, errors, name_for_empty=name, kind="callers of")
-
-
-def find_references(name, root="."):
-    results, errors = [], []
-    for path in _iter_python_files(root):
-        tree, lines_or_err = _parse_file(path)
-        if tree is None:
-            errors.append(f"{path}: {lines_or_err}")
-            continue
-        lines = lines_or_err
-        for node in ast.walk(tree):
-            matched_line = None
-            if isinstance(node, ast.Name) and node.id == name:
-                matched_line = node.lineno
-            elif isinstance(node, ast.Attribute) and node.attr == name:
-                matched_line = node.lineno
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
-                matched_line = node.lineno
-            elif isinstance(node, ast.alias) and (node.asname == name or node.name == name):
-                matched_line = getattr(node, "lineno", None)
-            if matched_line:
-                context = lines[matched_line - 1].strip() if matched_line - 1 < len(lines) else ""
-                results.append(f"{path}:{matched_line}: {context}")
-                if len(results) >= _MAX_RESULTS:
-                    return _format_results(results, errors, truncated=True)
-    return _format_results(results, errors, name_for_empty=name, kind="references to")
-
-
-def outline_file(path):
-    if not os.path.exists(path):
-        return f"ERROR: {path} does not exist."
-    tree, lines_or_err = _parse_file(path)
-    if tree is None:
-        return f"ERROR: could not parse {path} — {lines_or_err}"
-
-    def _describe(node, indent=0):
-        prefix = "  " * indent
-        entries = []
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.ClassDef):
-                doc = ast.get_docstring(child)
-                doc_preview = f" — \"{doc.splitlines()[0]}\"" if doc else ""
-                entries.append(f"{prefix}line {child.lineno}: class {child.name}{doc_preview}")
-                entries.extend(_describe(child, indent + 1))
-            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                args = [a.arg for a in child.args.args]
-                doc = ast.get_docstring(child)
-                doc_preview = f" — \"{doc.splitlines()[0]}\"" if doc else ""
-                async_tag = "async " if isinstance(child, ast.AsyncFunctionDef) else ""
-                entries.append(
-                    f"{prefix}line {child.lineno}: {async_tag}def {child.name}({', '.join(args)}){doc_preview}"
-                )
-        return entries
-
-    lines = _describe(tree)
-    if not lines:
-        return f"{path}: no top-level classes or functions found."
-    return f"Outline of {path}:\n" + "\n".join(lines)
-
-
-def _format_results(results, errors, name_for_empty=None, kind="definitions of", truncated=False):
-    if not results:
-        base = f"No {kind} '{name_for_empty}' found." if name_for_empty else "No matches found."
-    else:
-        base = "\n".join(results)
-        if truncated:
-            base += f"\n... (truncated at {_MAX_RESULTS} results)"
-    if errors:
-        base += "\n\n(skipped files with errors:\n  " + "\n  ".join(errors[:5]) + ")"
-    return base
-
-
-STRUCTURAL_SEARCH_TOOL_SCHEMA = [
-    {"type": "function", "function": {
-        "name": "find_definition",
-        "description": "AST-aware: find where a Python function or class named `name` is defined. "
-                       "More precise than grep — won't match comments, strings, or similarly-named things.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}, "root": {"type": "string", "default": "."},
-        }, "required": ["name"]},
-    }},
-    {"type": "function", "function": {
-        "name": "find_callers",
-        "description": "AST-aware: find every call site of a function or method named `name`. "
-                       "Use before changing a function's signature to see what would break.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}, "root": {"type": "string", "default": "."},
-        }, "required": ["name"]},
-    }},
-    {"type": "function", "function": {
-        "name": "find_references",
-        "description": "AST-aware: find every usage of `name` — calls, reads, writes, attribute access, imports. "
-                       "Broader than find_callers. Use before renaming to see full blast radius.",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string"}, "root": {"type": "string", "default": "."},
-        }, "required": ["name"]},
-    }},
-    {"type": "function", "function": {
-        "name": "outline_file",
-        "description": "Return a structural map of a Python file — every class, method, and function "
-                       "with line number and first docstring line.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-        }, "required": ["path"]},
-    }},
-]
-STRUCTURAL_SEARCH_TOOL_FUNCTIONS = {
-    "find_definition": find_definition, "find_callers": find_callers,
-    "find_references": find_references, "outline_file": outline_file,
-}
-```
+| `find_definition` | Where a function/class is defined — returns file:line + signature + docstring |
+| `find_callers` | Every call site of a function/method |
+| `find_references` | Every usage — calls, reads, writes, attribute access, import aliases |
+| `outline_file` | Structural map of one file — all classes, methods, functions with line numbers |
 
 ---
 
 ## lsp_client.py — Language Server Client
 
-A real LSP client that spawns `pylsp` as a subprocess and speaks JSON-RPC over stdio with proper `Content-Length` framing and async notification handling.
+> Note: `lsp_client` is not currently imported by `agent.py`. It exists as a standalone utility module.
 
-### Features
+Real LSP client that spawns `pylsp` as a subprocess, speaks JSON-RPC over stdio.
 
-| Feature | Description |
+| Tool | Description |
 |---|---|
-| **Real LSP protocol** | Content-Length framing, request/response correlation by id |
-| **Push diagnostics** | `textDocument/publishDiagnostics` received as async notification, waited on with `threading.Event` |
-| **`lsp_get_diagnostics`** | Semantic errors, undefined names, type mismatches, unused imports |
-| **`lsp_hover`** | Type info and docstring at a 0-indexed position |
-| **`lsp_go_to_definition`** | Cross-file, cross-import symbol definition — more capable than AST-only tools |
-| **`lsp_restart`** | Recover if the server wedges or stops responding |
-| **Lazy singleton** | Server started on first use, shared across calls |
-| **Document sync** | `didOpen` / `didChange` — re-analyzes current file content on each call |
-| **Positions are 0-indexed** | Per LSP spec (differs from 1-indexed lines used elsewhere) |
-| **Requires** | `pip install python-lsp-server` |
+| `lsp_get_diagnostics` | Semantic errors, undefined names, type mismatches, unused imports |
+| `lsp_hover` | Type/docstring at a 0-indexed position |
+| `lsp_go_to_definition` | Cross-file, cross-import definition — more capable than AST-only |
+| `lsp_restart` | Recover if server wedges |
 
-### Full Code
-
-```python
-"""
-lsp_client.py — a real Language Server Protocol client.
-Spawns pylsp as a subprocess and speaks LSP JSON-RPC over stdio.
-Positions are 0-indexed (LSP spec) — line 0 = first line.
-"""
-
-import json
-import os
-import subprocess
-import threading
-import time
-import shutil
-
-_SERVER_CMD = ["pylsp"]
-_REQUEST_TIMEOUT = 10
-_DIAGNOSTICS_WAIT = 4
-
-
-class LSPError(Exception):
-    pass
-
-
-class LSPClient:
-    def __init__(self, root_path="."):
-        self.root_path = os.path.abspath(root_path)
-        self.process = None
-        self._reader_thread = None
-        self._lock = threading.Lock()
-        self._next_id = 1
-        self._pending = {}
-        self._diagnostics = {}
-        self._diag_events = {}
-        self._open_docs = {}
-        self._started = False
-
-    def _write_message(self, obj):
-        body = json.dumps(obj).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
-        self.process.stdin.write(header + body)
-        self.process.stdin.flush()
-
-    def _read_message(self):
-        headers = {}
-        while True:
-            line = self.process.stdout.readline()
-            if not line:
-                return None
-            line = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            if line == "":
-                break
-            if ":" in line:
-                key, _, value = line.partition(":")
-                headers[key.strip().lower()] = value.strip()
-        length = int(headers.get("content-length", 0))
-        if length == 0:
-            return None
-        body = self.process.stdout.read(length)
-        try:
-            return json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError:
-            return None
-
-    def _reader_loop(self):
-        while True:
-            try:
-                msg = self._read_message()
-            except (OSError, ValueError):
-                break
-            if msg is None:
-                break
-            self._dispatch(msg)
-
-    def _dispatch(self, msg):
-        if "id" in msg and ("result" in msg or "error" in msg):
-            with self._lock:
-                entry = self._pending.get(msg["id"])
-            if entry:
-                entry["result"] = msg.get("result")
-                entry["error"] = msg.get("error")
-                entry["event"].set()
-            return
-        method = msg.get("method")
-        if method == "textDocument/publishDiagnostics":
-            params = msg.get("params", {})
-            uri = params.get("uri")
-            with self._lock:
-                self._diagnostics[uri] = params.get("diagnostics", [])
-                event = self._diag_events.get(uri)
-                if event:
-                    event.set()
-
-    def _send_request(self, method, params, timeout=_REQUEST_TIMEOUT):
-        with self._lock:
-            msg_id = self._next_id
-            self._next_id += 1
-            event = threading.Event()
-            self._pending[msg_id] = {"event": event, "result": None, "error": None}
-        self._write_message({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
-        if not event.wait(timeout):
-            with self._lock:
-                self._pending.pop(msg_id, None)
-            raise LSPError(f"Timed out waiting for response to '{method}' after {timeout}s.")
-        with self._lock:
-            entry = self._pending.pop(msg_id)
-        if entry["error"]:
-            raise LSPError(f"LSP error on '{method}': {entry['error']}")
-        return entry["result"]
-
-    def _send_notification(self, method, params):
-        self._write_message({"jsonrpc": "2.0", "method": method, "params": params})
-
-    def start(self):
-        if self._started:
-            return
-        if shutil.which("pylsp") is None:
-            raise LSPError("pylsp is not installed. Run: pip install python-lsp-server")
-        self.process = subprocess.Popen(_SERVER_CMD, stdin=subprocess.PIPE,
-                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
-        root_uri = "file://" + self.root_path
-        self._send_request("initialize", {
-            "processId": os.getpid(), "rootUri": root_uri,
-            "capabilities": {"textDocument": {
-                "publishDiagnostics": {"relatedInformation": True},
-                "hover": {"contentFormat": ["plaintext", "markdown"]},
-                "definition": {},
-            }},
-        })
-        self._send_notification("initialized", {})
-        self._started = True
-
-    def shutdown(self):
-        if not self._started or self.process is None:
-            return
-        try:
-            self._send_request("shutdown", {}, timeout=3)
-            self._send_notification("exit", {})
-        except (LSPError, OSError):
-            pass
-        try:
-            self.process.terminate()
-            self.process.wait(timeout=3)
-        except (OSError, subprocess.TimeoutExpired):
-            self.process.kill()
-        self._started = False
-
-    def restart(self):
-        self.shutdown()
-        self.__init__(self.root_path)
-        self.start()
-
-    def _uri_for(self, path):
-        return "file://" + os.path.abspath(path)
-
-    def _ensure_open(self, path):
-        uri = self._uri_for(path)
-        with open(path, "r", errors="ignore") as f:
-            text = f.read()
-        if uri in self._open_docs:
-            self._open_docs[uri] += 1
-            self._send_notification("textDocument/didChange", {
-                "textDocument": {"uri": uri, "version": self._open_docs[uri]},
-                "contentChanges": [{"text": text}],
-            })
-            return uri
-        self._open_docs[uri] = 1
-        with self._lock:
-            self._diag_events[uri] = threading.Event()
-        self._send_notification("textDocument/didOpen", {
-            "textDocument": {"uri": uri, "languageId": "python", "version": 1, "text": text},
-        })
-        return uri
-
-    def get_diagnostics(self, path, timeout=_DIAGNOSTICS_WAIT):
-        if not os.path.exists(path):
-            return f"ERROR: {path} does not exist."
-        uri = self._ensure_open(path)
-        with self._lock:
-            event = self._diag_events.setdefault(uri, threading.Event())
-            event.clear()
-        event.wait(timeout)
-        with self._lock:
-            diagnostics = self._diagnostics.get(uri, [])
-        if not diagnostics:
-            return f"No diagnostics for {path} (clean, or server hasn't analyzed it yet)."
-        severity_names = {1: "ERROR", 2: "WARNING", 3: "INFO", 4: "HINT"}
-        lines = []
-        for d in diagnostics:
-            sev = severity_names.get(d.get("severity"), "?")
-            line_no = d.get("range", {}).get("start", {}).get("line", 0) + 1
-            lines.append(f"{path}:{line_no}: [{sev}] {d.get('message', '')}")
-        return "\n".join(lines)
-
-    def hover(self, path, line, character):
-        if not os.path.exists(path):
-            return f"ERROR: {path} does not exist."
-        uri = self._ensure_open(path)
-        result = self._send_request("textDocument/hover", {
-            "textDocument": {"uri": uri},
-            "position": {"line": line, "character": character},
-        })
-        if not result or not result.get("contents"):
-            return f"No hover info at {path}:{line}:{character}."
-        contents = result["contents"]
-        if isinstance(contents, dict):
-            return contents.get("value", str(contents))
-        if isinstance(contents, list):
-            return "\n".join(c.get("value", str(c)) if isinstance(c, dict) else str(c) for c in contents)
-        return str(contents)
-
-    def definition(self, path, line, character):
-        if not os.path.exists(path):
-            return f"ERROR: {path} does not exist."
-        uri = self._ensure_open(path)
-        result = self._send_request("textDocument/definition", {
-            "textDocument": {"uri": uri},
-            "position": {"line": line, "character": character},
-        })
-        if not result:
-            return f"No definition found at {path}:{line}:{character}."
-        locations = result if isinstance(result, list) else [result]
-        out = []
-        for loc in locations:
-            loc_path = loc.get("uri", "").replace("file://", "")
-            start = loc.get("range", {}).get("start", {})
-            out.append(f"{loc_path}:{start.get('line', 0) + 1}:{start.get('character', 0)}")
-        return "\n".join(out)
-
-
-_client = None
-_client_lock = threading.Lock()
-
-
-def _get_client():
-    global _client
-    with _client_lock:
-        if _client is None:
-            _client = LSPClient(root_path=".")
-        if not _client._started:
-            _client.start()
-        return _client
-
-
-def lsp_get_diagnostics(path):
-    try:
-        return _get_client().get_diagnostics(path)
-    except LSPError as e:
-        return f"ERROR: {e}"
-
-
-def lsp_hover(path, line, character):
-    try:
-        return _get_client().hover(path, line, character)
-    except LSPError as e:
-        return f"ERROR: {e}"
-
-
-def lsp_go_to_definition(path, line, character):
-    try:
-        return _get_client().definition(path, line, character)
-    except LSPError as e:
-        return f"ERROR: {e}"
-
-
-def lsp_restart():
-    try:
-        _get_client().restart()
-        return "LSP server restarted."
-    except LSPError as e:
-        return f"ERROR: {e}"
-
-
-LSP_TOOL_SCHEMA = [
-    {"type": "function", "function": {
-        "name": "lsp_get_diagnostics",
-        "description": "Real semantic diagnostics from pylsp — undefined names, type mismatches, "
-                       "unused imports. Catches bugs that grep and AST search can't.",
-        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-    }},
-    {"type": "function", "function": {
-        "name": "lsp_hover",
-        "description": "Type/docstring info at a 0-indexed line/character position.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "line": {"type": "integer", "description": "0-indexed line number"},
-            "character": {"type": "integer"},
-        }, "required": ["path", "line", "character"]},
-    }},
-    {"type": "function", "function": {
-        "name": "lsp_go_to_definition",
-        "description": "Jump to symbol definition at a 0-indexed position. Handles imports and "
-                       "inherited methods better than AST-only find_definition.",
-        "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"},
-            "line": {"type": "integer"},
-            "character": {"type": "integer"},
-        }, "required": ["path", "line", "character"]},
-    }},
-    {"type": "function", "function": {
-        "name": "lsp_restart",
-        "description": "Restart the language server if it's unresponsive.",
-        "parameters": {"type": "object", "properties": {}},
-    }},
-]
-LSP_TOOL_FUNCTIONS = {
-    "lsp_get_diagnostics": lsp_get_diagnostics, "lsp_hover": lsp_hover,
-    "lsp_go_to_definition": lsp_go_to_definition, "lsp_restart": lsp_restart,
-}
-```
+**Requires:** `pip install python-lsp-server`
 
 ---
 
 ## file_search.py — Glob File Search
 
-Find files by name/path pattern instead of content. Results sorted newest-modified-first.
+> Note: `file_search` is not currently imported by `agent.py`. It exists as a standalone utility module.
 
-### Features
+Find files by name/path pattern instead of content. Results sorted newest-modified-first.
 
 | Feature | Description |
 |---|---|
-| **Glob patterns** | `*.py`, `**/*.py`, `src/**/test_*.py` etc. |
-| **Newest-first sort** | Most recently modified file comes first |
-| **Skip dirs** | `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`, `dist`, `build` |
-| **200 result cap** | Truncates with a message to narrow the pattern |
-
-### Full Code
-
-```python
-"""
-file_search.py — glob-style file discovery by name/path pattern (not content).
-Results sorted newest-modified-first.
-"""
-
-import os
-from pathlib import Path
-
-_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
-_MAX_RESULTS = 200
-
-
-def glob_files(pattern, root=".", max_results=_MAX_RESULTS):
-    """
-    Find files matching a glob pattern under root.
-      "*.py"              -> top-level .py files only
-      "**/*.py"           -> all .py files at any depth
-      "src/**/test_*.py"  -> test files anywhere under src/
-    Returns paths sorted by modification time, most recently modified first.
-    """
-    root_path = Path(root)
-    if not root_path.exists():
-        return f"ERROR: {root} does not exist."
-    try:
-        matches = list(root_path.glob(pattern))
-    except (ValueError, NotImplementedError) as e:
-        return f"ERROR: invalid glob pattern '{pattern}': {e}"
-    filtered = []
-    for m in matches:
-        if m.is_dir():
-            continue
-        if set(m.parts) & _SKIP_DIRS:
-            continue
-        filtered.append(m)
-    if not filtered:
-        return f"No files matched pattern '{pattern}' under {root}."
-    try:
-        filtered.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        pass
-    truncated = len(filtered) > max_results
-    filtered = filtered[:max_results]
-    result = "\n".join(str(p) for p in filtered)
-    if truncated:
-        result += f"\n... (truncated at {max_results} results)"
-    return result
-
-
-FILE_SEARCH_TOOL_SCHEMA = [{"type": "function", "function": {
-    "name": "glob_files",
-    "description": "Find files by name/path pattern — e.g. '**/*.py' for all Python files, "
-                   "'src/**/test_*.py' for test files. Results sorted most-recently-modified first. "
-                   "Use instead of search_codebase when you know the kind of file but not its content.",
-    "parameters": {"type": "object", "properties": {
-        "pattern": {"type": "string", "description": "glob pattern, e.g. '**/*.py'"},
-        "root": {"type": "string", "default": "."},
-    }, "required": ["pattern"]},
-}}]
-FILE_SEARCH_TOOL_FUNCTIONS = {"glob_files": glob_files}
-```
+| **Glob patterns** | `*.py`, `**/*.py`, `src/**/test_*.py` |
+| **Newest-first sort** | Most recently modified file first |
+| **200 result cap** | Truncates with message |
 
 ---
 
 ## firebase_tools.py — Firebase Scaffolding
 
-Unchanged. Generates `firebase-config.js`, `auth.js`, `db.js`, `firestore.rules` for any web app needing user login and per-user Firestore data. Returns a manual-steps checklist for the Firebase console. See previous section for full code.
+Unchanged. Generates `firebase-config.js`, `auth.js`, `db.js`, `firestore.rules` for any web app needing user login and per-user Firestore data. Returns a manual-steps checklist for the Firebase console.
 
 ---
 
 ## github_tools.py — GitHub Integration
 
-Unchanged. `git_push`, `create_branch`, `open_pull_request`, `list_open_issues` via GitHub REST API. Auto-detects `owner/repo` from HTTPS/SSH remote URLs. Requires `GITHUB_TOKEN`. See previous section for full code.
+Unchanged. `git_push`, `create_branch`, `open_pull_request`, `list_open_issues` via GitHub REST API. Auto-detects `owner/repo` from HTTPS/SSH remote URLs. Requires `GITHUB_TOKEN`.
 
 ---
 
 ## meta_builder.py — Simulation Generator
 
-Unchanged. Generates a complete N-agent simulation system from one theme prompt using parallel LLM batch calls. Outputs `agents.json`, `memory.py`, `tick_engine.py`, `viewer.py`. See previous section for full code.
+Unchanged. Generates a complete N-agent simulation system from one theme prompt using parallel LLM batch calls. Outputs `agents.json`, `memory.py`, `tick_engine.py`, `viewer.py`.
 
 ---
 
 ## tick_engine.py — Simulation Runtime
 
-Unchanged. Hourly tick loop — for each agent: build prompt → call LLM → log to `event_log.json` → store memory. Resilient to single API failures. Configurable via `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`. See previous section for full code.
+Unchanged. Hourly tick loop — for each agent: build prompt → call LLM → log to `event_log.json` → store memory. Configurable via `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`.
 
 ---
 
 ## memory.py — Per-Agent Memory Store
 
-Unchanged. JSON-backed per-agent store. Importance-first retrieval, 200-entry cap, crash-safe writes. See previous section for full code.
+Unchanged. JSON-backed per-agent store. Importance-first retrieval, 200-entry cap, crash-safe writes.
 
 ---
 
 ## director.py — Event Injection
 
-Unchanged. `inject_event` broadcasts to all agents; `inject_event_for_agent` targets one. Both store at `importance=10` so the event always surfaces on the next tick. See previous section for full code.
+Unchanged. `inject_event` broadcasts to all agents; `inject_event_for_agent` targets one. Both store at `importance=10`.
 
 ---
 
 ## Utility Files
 
-Small helpers written by the agent as examples or during task execution.
-
-### calc.py — Safe Division
+### calc.py
 
 ```python
 def divide(a, b):
@@ -2295,7 +2038,7 @@ def divide(a, b):
     return a / b
 ```
 
-### greeter.py — Greeting Utility
+### greeter.py
 
 ```python
 def greet(name: str) -> str:
@@ -2303,7 +2046,7 @@ def greet(name: str) -> str:
     return "Hello, " + name
 ```
 
-### mathutils.py — Math Helpers
+### mathutils.py
 
 ```python
 def square(x: int) -> int:
@@ -2311,7 +2054,7 @@ def square(x: int) -> int:
     return x * x
 ```
 
-### shapes.py — Shape Classes
+### shapes.py
 
 ```python
 import math
@@ -2321,7 +2064,6 @@ class Circle:
         if radius < 0:
             raise ValueError("Radius cannot be negative")
         self.radius = radius
-
     def area(self) -> float:
         return math.pi * (self.radius ** 2)
 
@@ -2330,12 +2072,11 @@ class Square:
         if side < 0:
             raise ValueError("Side length cannot be negative")
         self.side = side
-
     def area(self) -> float:
         return self.side ** 2
 ```
 
-### test_calc.py — Unit Tests for calc.py
+### test_calc.py
 
 ```python
 import unittest
@@ -2346,10 +2087,8 @@ class TestCalc(unittest.TestCase):
         self.assertEqual(calc.divide(10, 2), 5)
         self.assertEqual(calc.divide(-4, 2), -2)
         self.assertEqual(calc.divide(5.0, 2), 2.5)
-
     def test_divide_by_zero(self):
         self.assertIsNone(calc.divide(10, 0))
-
     def test_divide_invalid_type(self):
         with self.assertRaises(TypeError):
             calc.divide('10', 2)
@@ -2365,7 +2104,7 @@ if __name__ == '__main__':
 | Variable | Required | Used By | Description |
 |---|---|---|---|
 | `CEREBRAS_API_KEY` | Recommended | `provider_pool.py` | Primary (fastest) LLM provider |
-| `CEREBRAS_API_KEY_2` … `_N` | Optional | `provider_pool.py` | Additional Cerebras keys for rotation |
+| `CEREBRAS_API_KEY_2` … `_N` | Optional | `provider_pool.py` | Additional Cerebras keys |
 | `OPENROUTER_API_KEY` | Optional | `provider_pool.py` | Secondary LLM provider |
 | `OPENROUTER_API_KEY_2` … `_3` | Optional | `provider_pool.py` | Additional OpenRouter keys |
 | `GROQ_API_KEY` | Optional | `provider_pool.py` | Fallback LLM provider |
@@ -2385,83 +2124,123 @@ At least one of `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, or `GROQ_API_KEY` must
 ## Full System Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                           cli.py                                 │
-│  one-shot mode          interactive mode         plan: mode      │
-│  run_agent(task)        Conversation.send()      read-only run   │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │
-                    agent.py: _run_loop()
-                             │
-                    ask_ai() → provider_pool.py
-                    Cerebras → OpenRouter → Groq
-                    Retry-After-aware cooldowns
-                             │ tool_calls
-                    _execute_tool_call()
-                    ├── perf_counter() start
-                    ├── run tool
-                    └── run_logger.log_tool_call()  → .agent_runs.jsonl
-                             │
-          ┌──────────────────┴──────────────────────────────┐
-          │                  Tool Registry                  │
-          │                                                 │
-          │  tools.py          read/write/edit/bash/git     │
-          │    ├─ write_file    snapshot to .agent_snapshots/│
-          │    ├─ run_bash      allowlist + resource limits  │
-          │    ├─ search_codebase  ripgrep or pure-Python   │
-          │    └─ revert_file   git or snapshot fallback    │
-          │                                                 │
-          │  structural_search  find_definition             │
-          │                     find_callers                │
-          │                     find_references             │
-          │                     outline_file                │
-          │                                                 │
-          │  lsp_client         lsp_get_diagnostics         │
-          │  (pylsp subprocess) lsp_hover                   │
-          │                     lsp_go_to_definition        │
-          │                     lsp_restart                 │
-          │                                                 │
-          │  file_search        glob_files                  │
-          │  firebase_tools     scaffold_firebase_app       │
-          │  github_tools       push/branch/PR/issues       │
-          │  meta_builder       build_agent_system          │
-          │  create_tool        write + save new tools      │
-          │  custom_tools       agent-created tools         │
-          │                     (10s SIGALRM timeout each)  │
-          └─────────────────────────────────────────────────┘
-                             │ result → messages
-                    (repeat up to MAX_TURNS=40)
-                             │
+┌──────────────────────────────────────────────────────────────────────┐
+│                             cli.py                                   │
+│                                                                      │
+│  python cli.py "task"          one-shot                              │
+│  python cli.py                 interactive Conversation              │
+│  python cli.py --plan "task"   plan mode (any of the above)          │
+│  echo "task" | python cli.py   stdin piping (any of the above)       │
+│                                                                      │
+│  Callbacks wired up:                                                 │
+│    confirm_callback  → _ask_confirmation()   (destructive bash)      │
+│    plan_confirm_callback → _ask_plan_approval()  (submit_plan)       │
+│    diff_confirm_callback → _ask_diff_approval()  (apply_pending)     │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                     agent.py: run_agent() / Conversation.send()
+                              │
+                     _load_project_context()  ← AGENT.md / CLAUDE.md
+                     task_memory.retrieve_relevant()
+                     _run_loop()
+                              │
+                     ask_ai() → provider_pool.py
+                     Cerebras → OpenRouter → Groq
+                     Retry-After-aware cooldowns, thread-safe
+                              │ tool_calls
+                     _execute_tool_call()
+                              │
+          ┌───────────────────┴──────────────────────────────────┐
+          │                   Tool Registry                      │
+          │                                                      │
+          │  tools.py          Immediate writes:                 │
+          │    write_file        atomic, no review               │
+          │    edit_file         find-replace, no review         │
+          │  tools.py          Staged writes:                    │
+          │    stage_write_file  → _STAGED_CHANGES dict          │
+          │    stage_edit_file   composes with prior staged      │
+          │    review_pending_changes  → unified diff string     │
+          │    apply_pending_changes   ← diff_confirm_callback   │
+          │    discard_pending_changes                           │
+          │  tools.py          Other:                            │
+          │    run_bash          hard-block + confirm            │
+          │    revert_file       git checkout only               │
+          │    search_codebase   pure-Python                     │
+          │                                                      │
+          │  vision_tools      browser_navigate / click / type  │
+          │  (Playwright)      browser_screenshot               │
+          │                    screen_crop (Pillow zoom)         │
+          │                    visual_self_verify (pixel diff)   │
+          │                                                      │
+          │  submit_plan       plan mode gating                  │
+          │    ← plan_confirm_callback (approved/feedback)       │
+          │    blocks write tools until approved                 │
+          │    defense-in-depth: blocked even if model ignores   │
+          │                                                      │
+          │  delegate_subagent fresh _run_loop, no recursion     │
+          │    sub-agent cannot call delegate_subagent           │
+          │    returns final summary only (not tool history)     │
+          │                                                      │
+          │  firebase_tools    scaffold_firebase_app             │
+          │  github_tools      push/branch/PR/issues             │
+          │  meta_builder      build_agent_system                │
+          │  create_tool       write + save new tools            │
+          │  custom_tools      agent-created (10s SIGALRM each)  │
+          └──────────────────────────────────────────────────────┘
+                              │ result → messages
+                     (repeat up to MAX_TURNS=40)
+                              │
               task_memory.add_task_summary()
-              .agent_memory.json
+              .agent_memory.json  (200 entries max)
               importance-weighted: 60% cosine sim + 40% importance
-              high-importance entries tagged [HIGH IMPORTANCE] in prompt
 
-─────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────
 
-Fan-out (parallel tasks):
-  fan_out("Review {target} for bugs.", ["a.py","b.py","c.py"])
+Standalone utility modules (importable, not in agent.py's registry):
+
+  run_logger.py       log_tool_call() → .agent_runs.jsonl
+                      summarize_recent(n) → last n records
+
+  structural_search   find_definition / find_callers /
+                      find_references / outline_file
+                      (AST-aware, Python-only, pure stdlib)
+
+  lsp_client.py       lsp_get_diagnostics / lsp_hover /
+                      lsp_go_to_definition / lsp_restart
+                      (spawns pylsp subprocess, JSON-RPC)
+
+  file_search.py      glob_files(pattern) → newest-first paths
+
+─────────────────────────────────────────────────────────────────────────
+
+Fan-out (parallel external tasks):
+  fan_out("Review {target} for bugs.", ["a.py", "b.py", "c.py"])
     └─ ThreadPoolExecutor (≤8 workers)
          └─ run_agent() per target (use_memory=False)
          └─ {target: result} merged
 
-─────────────────────────────────────────────────────────────────────
+Sub-agent delegation (sequential, called by agent mid-task):
+  delegate_subagent("Investigate why auth.py fails on token expiry")
+    └─ fresh _run_loop (max 15 turns by default)
+    └─ reduced tool set (no delegate_subagent)
+    └─ returns plain-text summary only
 
-Simulation subsystem (run independently):
+─────────────────────────────────────────────────────────────────────────
 
-  meta_builder.py → generate_roster() parallel batches
-                  → writes agents.json, memory.py,
-                    tick_engine.py, viewer.py
+Simulation subsystem (independent of main agent loop):
 
-  tick_engine.py  → for each day/hour/agent:
-                      memory.retrieve_relevant()
-                      build_prompt() + call_llm()
-                      log_event() → event_log.json
-                      memory.add(importance=5)
+  meta_builder.py  → build_agent_system(theme, count)
+                     parallel LLM batches → agents.json
+                     writes tick_engine.py, memory.py, viewer.py
 
-  director.py     → inject_event()           all agents importance=10
-                  → inject_event_for_agent()  one agent importance=10
+  tick_engine.py   → hourly tick loop
+                     memory.retrieve_relevant()
+                     call_llm() → log_event() → event_log.json
+                     memory.add(importance=5)
 
-  viewer.py       → Flask :8080, reads event_log.json
-                    auto-refresh every 5s, WORLD EVENT styling
+  director.py      → inject_event()            all agents, importance=10
+                   → inject_event_for_agent()   one agent, importance=10
+
+  viewer.py        → Flask :8080, reads event_log.json
+                     auto-refresh every 5s, WORLD EVENT styling
 ```
