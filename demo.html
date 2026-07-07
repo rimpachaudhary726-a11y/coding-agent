@@ -6,6 +6,18 @@
   <style>
     body { margin: 0; overflow: hidden; }
     canvas { display: block; }
+#status {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  padding: 5px 10px;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 14px;
+  border-radius: 4px;
+  z-index: 1000;
+}
   </style>
 </head>
 <body>
@@ -46,10 +58,12 @@
       groundMesh.position.y = -0.5; // align with physics ground
       scene.add(groundMesh);
       statusDiv.textContent += ' → Three.js initialized';
+      console.log('Three.js initialized');
 
       // Initialize Rapier
       await initRapier();
       statusDiv.textContent += ' → Rapier initialized';
+      console.log('Rapier initialized');
 
       const RAPIER = rapier; // global provided by Rapier init script
 
@@ -88,10 +102,13 @@
       const gravity = new RAPIER.Vector3(0, -9.81, 0);
       const world = new RAPIER.World(gravity);
 statusDiv.textContent += ' → Rapier world created';
+      console.log('Rapier world created');
 
       // Static ground collider (matches ground mesh)
       const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.5, 0);
       const groundBody = world.createRigidBody(groundBodyDesc);
+      statusDiv.textContent += ' → Ground collider created';
+      console.log('Ground collider created');
       const groundColliderDesc = RAPIER.ColliderDesc.cuboid(10, 0.5, 10);
       world.createCollider(groundColliderDesc, groundBody);
 
