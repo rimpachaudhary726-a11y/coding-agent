@@ -2,18 +2,12 @@
 agent.py — the core reasoning loop, plus fan-out for big tasks.
 
 UPDATED: every tool call is now logged (name, args, latency, result preview,
-error flag) to .agent_runs.jsonl via run_logger.log_tool_call().
-
-FIXED: on_step no longer fires for the final plain-text answer (the turn
-with no tool_calls). Previously it did, which meant the answer got printed
-once by on_step (e.g. cli.py's _print_step -> "🤖 ...") and then printed
-again by whoever consumes the return value of run_agent()/Conversation.send()
-(e.g. cli.py's "✅ {result}"). Now on_step only fires for turns that have
-tool_calls (i.e. intermediate steps), and the final answer is returned
-exactly once, to be printed exactly once by the caller.
+error flag) to .agent_runs.jsonl via run_logger.log_tool_call(). Everything
+else is unchanged from the original.
 """
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,6 +20,10 @@ from custom_tool_registry import CREATE_TOOL_SCHEMA, CREATE_TOOL_FUNCTIONS, load
 from structural_search import STRUCTURAL_SEARCH_TOOL_SCHEMA, STRUCTURAL_SEARCH_TOOL_FUNCTIONS
 from lsp_client import LSP_TOOL_SCHEMA, LSP_TOOL_FUNCTIONS
 from file_search import FILE_SEARCH_TOOL_SCHEMA, FILE_SEARCH_TOOL_FUNCTIONS
+from mcp_tools import (
+    MCP_TOOL_SCHEMA, MCP_TOOL_FUNCTIONS, connect_mcp_servers,
+    build_mcp_tool_schema_and_functions, MCP_CONFIG_FILE,
+)
 import task_memory
 import run_logger
 
@@ -53,13 +51,39 @@ for _err in _custom_load_errors:
 TOOL_SCHEMA = (
     TOOL_SCHEMA + FIREBASE_TOOL_SCHEMA + GITHUB_TOOL_SCHEMA
     + META_BUILDER_TOOL_SCHEMA + CREATE_TOOL_SCHEMA + STRUCTURAL_SEARCH_TOOL_SCHEMA
-    + LSP_TOOL_SCHEMA + FILE_SEARCH_TOOL_SCHEMA + _custom_schema
+    + LSP_TOOL_SCHEMA + FILE_SEARCH_TOOL_SCHEMA + MCP_TOOL_SCHEMA + _custom_schema
 )
 TOOL_FUNCTIONS = {
     **TOOL_FUNCTIONS, **FIREBASE_TOOL_FUNCTIONS, **GITHUB_TOOL_FUNCTIONS,
     **META_BUILDER_TOOL_FUNCTIONS, **CREATE_TOOL_FUNCTIONS, **STRUCTURAL_SEARCH_TOOL_FUNCTIONS,
-    **LSP_TOOL_FUNCTIONS, **FILE_SEARCH_TOOL_FUNCTIONS, **_custom_functions,
+    **LSP_TOOL_FUNCTIONS, **FILE_SEARCH_TOOL_FUNCTIONS, **MCP_TOOL_FUNCTIONS, **_custom_functions,
 }
+
+
+def _refresh_mcp_tools():
+    """Hot-reload after connect_mcp_servers — newly discovered per-server tools
+    (e.g. mcp_filesystem_read_file) become callable on the very next turn,
+    same pattern as _refresh_custom_tools for agent-created tools."""
+    schema_list, functions = build_mcp_tool_schema_and_functions()
+    existing_names = {entry["function"]["name"] for entry in TOOL_SCHEMA}
+    for entry in schema_list:
+        name = entry["function"]["name"]
+        if name not in existing_names:
+            TOOL_SCHEMA.append(entry)
+    TOOL_FUNCTIONS.update(functions)
+
+
+# Auto-connect any MCP servers configured in mcp_servers.json at startup, so
+# e.g. your filesystem server's tools are live immediately without having to
+# remember to call connect_mcp_servers manually every session. Best-effort —
+# a missing config file or a server that fails to start doesn't block startup.
+if os.path.exists(MCP_CONFIG_FILE):
+    try:
+        _mcp_startup_result = connect_mcp_servers()
+        print(f"[mcp] {_mcp_startup_result}")
+        _refresh_mcp_tools()
+    except Exception as e:
+        print(f"[mcp] startup connect failed (non-fatal): {e}")
 
 
 def _refresh_custom_tools():
@@ -94,6 +118,27 @@ AST-aware and won't match unrelated text in comments, strings, or similarly- \
 named things — they're precise where search_codebase is just text matching. \
 Use search_codebase for everything else: free-text search, non-Python files, \
 or when you don't yet know the exact symbol name.
+
+When you need to find files by name or pattern rather than content — "find all \
+the test files", "what config files exist", "what did I just edit" — use \
+glob_files instead of list_directory or search_codebase. list_directory only \
+sees one level deep; glob_files matches patterns like '**/*.py' recursively \
+and sorts by most-recently-modified, which is usually what you want.
+
+After editing a Python file, call lsp_get_diagnostics on it before running the \
+full test suite. It catches real semantic problems — undefined names, type \
+mismatches, unused imports — that neither search_codebase nor the AST tools \
+can see, and it's much cheaper than a full test run. Only fall back to \
+lsp_hover / lsp_go_to_definition when you specifically need type info or a \
+cross-file jump that find_definition can't resolve (e.g. through an import).
+
+Tools prefixed "mcp_" come from external MCP servers configured in \
+mcp_servers.json (already connected at startup if any are configured) — \
+treat them as regular tools once they appear in your tool list. If a task \
+needs a capability that sounds like it should exist as an external service \
+(filesystem access outside the project, a specific API, etc) and you don't \
+see an mcp_ tool for it, call list_mcp_tools to check what's actually \
+connected before assuming it's unavailable.
 
 If the project has a test suite, call detect_and_run_tests after making code \
 changes, before declaring the task done — don't just assume a fix works.
@@ -168,6 +213,9 @@ def _execute_tool_call(tool_call, confirm_destructive=False, confirm_callback=No
         if refresh_errors:
             result += f"\n(Note: {'; '.join(refresh_errors)})"
 
+    if name == "connect_mcp_servers":
+        _refresh_mcp_tools()
+
     run_logger.log_tool_call(name, args, result, latency_ms, is_error=is_error)
     return result
 
@@ -237,15 +285,7 @@ class Conversation:
 
 
 def _run_loop(messages, on_step, auto_confirm, confirm_callback):
-    """
-    Shared tool-calling loop used by run_agent() and Conversation.send().
-
-    on_step is only invoked for turns that contain tool_calls (i.e. the
-    model is still working / thinking through steps). The turn that
-    finally returns plain text with no tool_calls is NOT passed to
-    on_step — it's just returned, so the caller (cli.py etc.) prints it
-    exactly once instead of once via on_step and once via the return value.
-    """
+    """Shared tool-calling loop used by run_agent() and Conversation.send()."""
     consecutive_empty = 0
 
     for turn in range(MAX_TURNS):
@@ -257,13 +297,11 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback):
         content = message.get("content") if isinstance(message, dict) else message.content
         tool_calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
 
+        if on_step:
+            on_step({"turn": turn, "content": content, "tool_calls": tool_calls})
+
         if not tool_calls:
             if not content or not content.strip():
-                # Empty response with no tool calls — nudge the model to
-                # continue. Report this via on_step (no real content to
-                # double-print here) so live UIs still see something happened.
-                if on_step:
-                    on_step({"turn": turn, "content": None, "tool_calls": None})
                 consecutive_empty += 1
                 if consecutive_empty >= 2:
                     return "ERROR: model returned empty responses repeatedly — task did not complete. Try again or break the task into smaller steps."
@@ -273,14 +311,7 @@ def _run_loop(messages, on_step, auto_confirm, confirm_callback):
                     "content": "Your last response was empty. Please continue: either call a tool to keep working, or give a real final answer.",
                 })
                 continue
-
-            # Genuine final answer. Do NOT call on_step here — return it
-            # once, and let the single caller-side print show it.
             return content
-
-        # There are tool_calls: this is an intermediate step, safe to stream.
-        if on_step:
-            on_step({"turn": turn, "content": content, "tool_calls": tool_calls})
 
         consecutive_empty = 0
 

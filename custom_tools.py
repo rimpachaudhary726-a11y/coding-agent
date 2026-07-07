@@ -19,3 +19,20 @@ def count_python_lines(file_path: str) -> str:
         return f"{count}"
     except Exception as e:
         return f"ERROR: Could not read file: {e}"
+
+
+# --- word_count ---
+def word_count(path: str) -> int:
+    """Return the number of words in the file at *path*.
+
+    A word is defined as any sequence of characters separated by whitespace.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read file {path}: {e}")
+    # Split on any whitespace
+    words = content.split()
+    return len(words)
+

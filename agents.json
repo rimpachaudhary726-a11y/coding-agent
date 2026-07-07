@@ -1,105 +1,126 @@
 {
   "agents": [
     {
-      "id": "dr_maya_patel",
-      "name": "Dr. Maya Patel",
-      "role": "Senior Emergency Physician",
-      "personality": "decisive, compassionate, meticulous",
-      "backstory": "Born to immigrant parents, she rose through the ranks after surviving a traumatic car accident in medical school. She now leads the ER with a reputation for calm under pressure.",
+      "id": "alex",
+      "name": "Alex Rivera",
+      "role": "Barista",
+      "personality": "enthusiastic, meticulous, chatty",
+      "backstory": "Alex grew up watching his grandmother brew espresso and took a job at the coffee shop after college.",
       "routine": {
-        "0-6": "on-call, monitors critical patients remotely",
-        "6-9": "arrives for morning handoff, reviews charts",
-        "9-12": "triages incoming cases, oversees procedures",
-        "12-15": "leads staff meeting, mentors residents",
-        "15-18": "direct patient care, performs surgeries",
-        "18-22": "wraps up cases, writes notes",
-        "22-24": "on-call standby"
-      },
-      "relationships": {},
-      "secret": "She is secretly researching a new triage protocol to secure a grant and boost her career."
-    },
-    {
-      "id": "nurse_joel_mills",
-      "name": "Joel Mills",
-      "role": "ER Nurse",
-      "personality": "upbeat, empathetic, hyper-organized",
-      "backstory": "A former paramedic who switched to nursing after a near-fatal shift taught him the value of continuity of care. He knows every corner of the ER.",
-      "routine": {
-        "0-6": "monitors ICU patients, updates charts",
-        "6-9": "prepares medication carts, assists Dr. Patel",
-        "9-12": "receives patients, coordinates with EMTs",
-        "12-15": "break, then returns to triage desk",
-        "15-18": "oversees wound care, supports residents",
-        "18-22": "final rounds, ensures supplies stocked",
-        "22-24": "on-call backup"
+        "0-6": "Sleeping",
+        "6-8": "Opening shop, setting up espresso machines",
+        "8-12": "Serving customers, crafting drinks",
+        "12-13": "Lunch break, sipping tea",
+        "13-18": "Peak service, handling rush",
+        "18-20": "Cleaning, restocking",
+        "20-22": "Closing duties, paperwork",
+        "22-24": "Leaving, commuting home"
       },
       "relationships": {
-        "dr_maya_patel": "admiring mentor",
-        "tech_li": "friendly sparring partner"
+        "mia": "Works closely, respects",
+        "jamie": "Friendly banter",
+        "toby": "Coordinates deliveries",
+        "luca": "Rivalry, occasional tension"
       },
-      "secret": "He hoards unused medical supplies to sell on the side to fund his brother's tuition."
+      "secret": "Dreams of opening his own specialty coffee van, hidden from the owner."
     },
     {
-      "id": "tech_li",
-      "name": "Samir Li",
-      "role": "Radiology Technician",
-      "personality": "analytical, introverted, meticulous",
-      "backstory": "A quiet genius who grew up coding medical imaging software, he now works the ER's imaging suite, often preferring machines over people. He dreams of developing AI diagnostics.",
+      "id": "mia",
+      "name": "Mia Chen",
+      "role": "Owner",
+      "personality": "pragmatic, caring, slightly anxious",
+      "backstory": "Mia inherited the shop from her aunt and strives to keep it a community hub.",
       "routine": {
-        "0-6": "maintains equipment, runs overnight scans",
-        "6-9": "prepares imaging rooms for morning surge",
-        "9-12": "processes X-rays, CTs, assists doctors",
-        "12-15": "lunch, then calibrates machines",
-        "15-18": "handles emergency imaging, fast-tracks critical cases",
-        "18-22": "troubleshoots issues, updates software",
-        "22-24": "on-call for after-hours imaging"
+        "0-7": "Sleeping",
+        "7-9": "Arriving early, checking finances",
+        "9-12": "Managing staff, ordering supplies",
+        "12-13": "Quick lunch, reading reviews",
+        "13-17": "Customer interactions, problem solving",
+        "17-19": "Planning events, marketing",
+        "19-22": "Closing tasks, paperwork",
+        "22-24": "Unwinding, late night emails"
       },
       "relationships": {
-        "nurse_joel_mills": "mutual respect, occasional debate"
+        "alex": "Employer, mentor",
+        "jamie": "Regular customer's friend",
+        "toby": "Vendor liaison",
+        "luca": "Rival cafe owner, uneasy competition"
       },
-      "secret": "He has embedded a hidden algorithm in the imaging software that can predict patient outcomes, hoping to sell it to a biotech firm."
+      "secret": "Has been secretly negotiating to sell the shop to a developer, but hasn't told anyone."
     },
     {
-      "id": "admin_kira_johnson",
-      "name": "Kira Johnson",
-      "role": "Hospital Administrator",
-      "personality": "pragmatic, assertive, diplomatic",
-      "backstory": "After a decade in corporate healthcare management, she was recruited to streamline the chaotic ER, aiming to improve efficiency and cut costs. She balances budget constraints with staff morale.",
+      "id": "jamie",
+      "name": "Jamie Patel",
+      "role": "Regular Customer",
+      "personality": "loyal, observant, witty",
+      "backstory": "Jamie works as a freelance graphic designer and stops by every morning for the perfect latte.",
       "routine": {
-        "0-6": "reviews overnight reports, plans staffing",
-        "6-9": "meets with Dr. Patel for shift briefing",
-        "9-12": "oversees admissions, handles insurance issues",
-        "12-15": "lunch with department heads, audits records",
-        "15-18": "negotiates supply contracts, addresses complaints",
-        "18-22": "prepares end-of-day summary, updates board",
-        "22-24": "on-call for emergencies"
+        "0-8": "Sleeping",
+        "8-9": "Morning jog, coffee stop at shop",
+        "9-12": "Freelance work at co-working space",
+        "12-13": "Lunch break, walks the park",
+        "13-16": "Client meetings, design work",
+        "16-18": "Afternoon coffee refill",
+        "18-22": "Evening social events, indie concerts",
+        "22-24": "Reading, sleeping"
       },
       "relationships": {
-        "dr_maya_patel": "professional respect",
-        "nurse_joel_mills": "occasionally clashed over staffing"
+        "alex": "Chatty barista, knows his name",
+        "mia": "Friendly with owner, sometimes helps with ideas",
+        "toby": "Occasional gratitude for fast deliveries",
+        "luca": "Unaware of rival's interest, just another cafe"
       },
-      "secret": "She is under pressure from the hospital board to report a declining patient satisfaction metric, fearing potential job loss."
+      "secret": "Is planning to open a small pop-up art gallery in the coffee shop, hoping Mia supports it."
     },
     {
-      "id": "intern_ayesha_khan",
-      "name": "Ayesha Khan",
-      "role": "Emergency Medicine Intern",
-      "personality": "eager, nervous, diligent",
-      "backstory": "A recent medical graduate from a small town, she joined the ER to gain experience after her father's death from a delayed diagnosis, fueling her determination to never miss a case. She looks up to Dr. Patel.",
+      "id": "toby",
+      "name": "Toby Singh",
+      "role": "Delivery Driver",
+      "personality": "punctual, easygoing, pragmatic",
+      "backstory": "Toby drives for the regional coffee bean supplier and enjoys the rhythm of the city streets.",
       "routine": {
-        "0-6": "on-call shadowing senior staff, takes notes",
-        "6-9": "attends morning briefing, reviews patient files",
-        "9-12": "assists in triage, writes initial notes",
-        "12-15": "spends time in charting, learns procedures",
-        "15-18": "participates in minor procedures under supervision",
-        "18-22": "debriefs with mentor, reflects on cases",
-        "22-24": "on-call backup"
+        "0-6": "Sleeping",
+        "6-7": "Checking route, loading truck",
+        "7-12": "Morning deliveries to local caf\u00e9s",
+        "12-13": "Lunch break, quick coffee",
+        "13-17": "Afternoon deliveries, returns",
+        "17-19": "Maintenance checks, paperwork",
+        "19-20": "Head home",
+        "20-24": "Relaxing with family"
       },
       "relationships": {
-        "dr_maya_patel": "mentor-mentee",
-        "admin_kira_johnson": "seeks approval"
+        "alex": "Coordinate daily deliveries",
+        "mia": "Handles invoices, friendly",
+        "jamie": "Sometimes meets during deliveries",
+        "luca": "Delivers to rival cafe as well"
       },
-      "secret": "She secretly keeps a journal of all diagnostic errors she witnesses, hoping to expose systemic flaws."
+      "secret": "Is actually scouting locations for a new boutique coffee brand, planning to switch loyalty."
+    },
+    {
+      "id": "luca",
+      "name": "Luca Moretti",
+      "role": "Rival Cafe Owner",
+      "personality": "charismatic, ambitious, secretive",
+      "backstory": "Luca runs the trendy cafe across the street and envies the close-knit community at the coffee shop.",
+      "routine": {
+        "0-6": "Sleeping",
+        "6-8": "Morning brainstorming, checking social media",
+        "8-10": "Morning coffee at his own cafe, meeting staff",
+        "10-12": "Strategizing menu upgrades, scouting trends",
+        "12-13": "Lunch with investors",
+        "13-16": "Visiting suppliers, occasional deliveries to Alex's shop",
+        "16-18": "Observing rival shop, noting regulars",
+        "18-20": "Hosting evening events, network",
+        "20-22": "Planning poach of key regulars, drafting proposals",
+        "22-24": "Late night paperwork"
+      },
+      "relationships": {
+        "alex": "Professional rivalry, occasional encounters",
+        "mia": "Competitive tension, occasional polite chats",
+        "jamie": "Wants to win over as a regular",
+        "toby": "Uses same delivery service, knows his schedule"
+      },
+      "secret": "Plans to tempt Jamie with a special loyalty program to steal her business and use her art gallery idea to attract a hip crowd."
     }
   ]
 }

@@ -99,9 +99,29 @@ async def _connect_one(name, server_config, exit_stack):
             streamablehttp_client(server_config["url"])
         )
     elif "command" in server_config:
-        env = None
-        if server_config.get("env"):
-            env = {**os.environ, **server_config["env"]}
+        # Always inherit the full parent environment, then layer any config-specified
+        # overrides on top. Passing env=None to the MCP SDK does NOT inherit the shell's
+        # environment — it substitutes a minimal restricted default set (PATH, HOME, etc)
+        # for security, which is missing vars some subprocess wrappers actually need.
+        env = {**os.environ, **(server_config.get("env") or {})}
+
+        # On Nix-based environments (e.g. Replit), npx's wrapper script requires
+        # XDG_CONFIG_HOME (and sometimes its siblings) to be SET, even to an empty-ish
+        # default — it's read with `set -u`, so an unset var is a hard crash regardless
+        # of whether the parent process happened to inherit it from somewhere. Rather
+        # than hope it's present in os.environ, guarantee sane defaults here.
+        home = env.get("HOME", os.path.expanduser("~"))
+        env.setdefault("XDG_CONFIG_HOME", os.path.join(home, ".config"))
+        env.setdefault("XDG_CACHE_HOME", os.path.join(home, ".cache"))
+        env.setdefault("XDG_DATA_HOME", os.path.join(home, ".local", "share"))
+        # Make sure the directories actually exist — some tools assume the path is
+        # not just set but real, and will fail differently (but still fail) otherwise.
+        for _xdg_dir in (env["XDG_CONFIG_HOME"], env["XDG_CACHE_HOME"], env["XDG_DATA_HOME"]):
+            try:
+                os.makedirs(_xdg_dir, exist_ok=True)
+            except OSError:
+                pass  # best-effort — if this fails, the real error will surface from npx itself
+
         params = StdioServerParameters(
             command=server_config["command"],
             args=server_config.get("args", []),
